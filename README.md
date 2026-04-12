@@ -3,6 +3,8 @@
 A Spark-inspired profiling plugin for Unturned dedicated servers.  
 Tells you **which code is eating your tick budget** without touching a production plugin's source.
 
+![Architecture chart.](https://github.com/alvin677/LagTrace/blob/main/lagtrace_architecture.svg)
+
 ---
 
 ## How it works
