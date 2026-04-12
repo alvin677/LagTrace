@@ -1,0 +1,40 @@
+name: Build LagTrace Plugin
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest  # Required for .NET Framework 4.8
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore LagTrace.csproj
+
+      - name: Build
+        run: |
+          msbuild LagTrace.csproj `
+            /p:Configuration=Release `
+            /p:Platform="AnyCPU" `
+            /p:TargetFrameworkVersion=v4.8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LagTrace-Plugin
+          path: |
+            bin/Release/LagTrace.dll
+            bin/Release/LagTrace.xml
+          if-no-files-found: error
