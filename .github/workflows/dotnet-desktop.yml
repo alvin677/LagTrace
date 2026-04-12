@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ main, master ]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest  # Required for .NET Framework 4.8
@@ -35,6 +38,14 @@ jobs:
         with:
           name: LagTrace-Plugin
           path: |
-            bin/Release/LagTrace.dll
-            bin/Release/LagTrace.xml
+            bin/Release/net48/LagTrace.dll
+            bin/Release/net48/LagTrace.xml
           if-no-files-found: error
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: bin/Release/net48/LagTrace.dll
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
