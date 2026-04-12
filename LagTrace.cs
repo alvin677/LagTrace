@@ -135,26 +135,39 @@ namespace LagTrace
             if (!_running) return;
 
             var mainThread = MainThreadRef.MainThread;
-            if (mainThread == null) return;
+            if (mainThread == null || mainThread != Thread.CurrentThread)
+            {
+                // Only log once per error, not every sample!
+                if (_stackTraceErrorLogged)
+                    return;
+                Logger.Log("[LagTrace] Warning: Stack trace on non-current thread — ignoring");
+                _stackTraceErrorLogged = true;
+                return;
+            }
 
-            StackTrace stackTrace = null;
+            StackTrace stackTrace;
             try
             {
-                // Cache stack trace if on same thread - saves allocations!
-                if (_cachedMainStackTraceThread != mainThread)
+                // Cache when we're actually sampling the current thread
+                if (_cachedMainStackTraceThread == mainThread && _cachedStackTrace != null)
                 {
-                    _cachedStackTrace = new StackTrace(mainThread, false);
-                    _cachedMainStackTraceThread = mainThread;
+                    stackTrace = _cachedStackTrace;
                 }
                 else
                 {
-                    stackTrace = _cachedStackTrace ?? new StackTrace(mainThread, false);
+                    _cachedStackTrace = new StackTrace(mainThread, false);
+                    _cachedMainStackTraceThread = mainThread;
+                    stackTrace = _cachedStackTrace;
                 }
             }
             catch (Exception ex)
             {
-                if (LagTracePlugin.Instance.Configuration.Instance.LogPatchErrors)
-                    Logger.Log($"[LagTrace] StackTrace error: {ex.Message}");
+                // Only warn once! Not on every sample!
+                if (_stackTraceErrorLogged)
+                    return;
+
+                Logger.Log($"[LagTrace] StackTrace error (logged once): {ex.Message}");
+                _stackTraceErrorLogged = true;
                 return;
             }
 
@@ -169,6 +182,9 @@ namespace LagTrace
             _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
             Interlocked.Increment(ref _totalSamples);
         }
+
+        // Add these fields to Sampler class:
+        private bool _stackTraceErrorLogged = false;
 
         public string[] GetLastStackSafe()
         {
