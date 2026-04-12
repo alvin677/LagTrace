@@ -16,17 +16,12 @@ using ThreadPriority = System.Threading.ThreadPriority;
 
 namespace LagTrace
 {
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  Entry point
-    // ─────────────────────────────────────────────────────────────────────────────
     public class LagTracePlugin : RocketPlugin<LagTraceConfig>
     {
         public static LagTracePlugin Instance { get; private set; }
-
         private Harmony _harmony;
         private Thread _samplerThread;
 
-        // Exposed so commands can read without locking.
         public static readonly Sampler Sampler = new Sampler();
         public static readonly SpikeDetector Spikes = new SpikeDetector();
 
@@ -34,21 +29,13 @@ namespace LagTrace
         {
             Instance = this;
 
-            // Load() is always called on the Unity main thread — capture it here
-            // so the sampler has a valid target before its thread starts.
             MainThreadRef.Capture();
 
             _harmony = new Harmony("com.lagtrace");
-            // No attribute-based [HarmonyPatch] classes remain — PatchAll is not called.
-            // This avoids Harmony trying to patch unpatchable Unity magic methods.
 
-            // Attach frame-timing component (replaces the old MonoBehaviour LateUpdate patch).
             gameObject.AddComponent<FrameTimingComponent>();
-
-            // Patch all RocketPlugin.FixedUpdate / Update that are currently loaded
             HarmonyPatcher.PatchLoadedPlugins(_harmony);
 
-            // Start background sampler (samples main thread stack every N ms)
             Sampler.BuildRegistry();
             Sampler.Start();
             _samplerThread = new Thread(SamplerLoop)
@@ -60,24 +47,28 @@ namespace LagTrace
             _samplerThread.Start();
 
             if (Configuration.Instance.AutoPrint)
-                InvokeRepeating(nameof(OnFlushWindow), 
-                    Configuration.Instance.WindowSeconds,
-                    Configuration.Instance.WindowSeconds);
+                InvokeRepeating(nameof(OnFlushWindow), Configuration.Instance.WindowSeconds, Configuration.Instance.WindowSeconds);
 
             Logger.Log("[LagTrace] Loaded. Commands: /lag, /lagtop, /lagplugins, /lagspike");
         }
 
         protected override void Unload()
         {
-            if (Configuration.Instance.AutoPrint)
-                CancelInvoke(nameof(OnFlushWindow));
+            if (Configuration.Instance.AutoPrint) CancelInvoke(nameof(OnFlushWindow));
             Sampler.Stop();
             _samplerThread?.Join(500);
             _harmony?.UnpatchAll("com.lagtrace");
+
+            // Config-driven cleanup option
+            if (Configuration.Instance.ClearOnUnload)
+            {
+                Sampler.Reset();
+                Timings.Reset();
+            }
+
             Logger.Log("[LagTrace] Unloaded.");
         }
 
-        // ── Sampler thread ──────────────────────────────────────────────────────
         private void SamplerLoop()
         {
             while (Sampler.Running)
@@ -87,8 +78,6 @@ namespace LagTrace
             }
         }
 
-        // ── Periodic flush ──────────────────────────────────────────────────────
-        // Called on Unity main thread by InvokeRepeating.
         private void OnFlushWindow()
         {
             var sb = new StringBuilder();
@@ -98,24 +87,21 @@ namespace LagTrace
             Logger.Log(sb.ToString());
         }
 
-        // ── Unity frame hook (patches applied before this) ─────────────────────
-        // Called by FrameTimingComponent every LateUpdate to feed spike detector.
         public static void OnFrameComplete(float deltaMs)
         {
             Spikes.Feed(deltaMs);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  Configuration
-    // ─────────────────────────────────────────────────────────────────────────────
     public class LagTraceConfig : Rocket.API.IRocketPluginConfiguration
     {
-        public int SampleIntervalMs = 5;     // How often the sampler snapshots
-        public int WindowSeconds = 60;    // Flush/report window
-        public float SpikeThresholdMs = 50f;  // A frame longer than this is a "spike"
-        public bool AutoPrint = false; // Print top to console each window
-        public int TopN = 10;    // Default rows for /lagtop
+        public int SampleIntervalMs = 5;
+        public int WindowSeconds = 60;
+        public float SpikeThresholdMs = 50f;
+        public bool AutoPrint = false;
+        public int TopN = 10;
+        public bool ClearOnUnload = true;  // NEW: Cleanup on unload
+        public bool LogPatchErrors = true; // NEW: Show Harmony patch errors
 
         public void LoadDefaults()
         {
@@ -124,41 +110,24 @@ namespace LagTrace
             SpikeThresholdMs = 50f;
             AutoPrint = false;
             TopN = 10;
+            ClearOnUnload = true;
+            LogPatchErrors = true;
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  SamplerEngine — wall-clock stack sampler (like async-profiler / Spark)
-    //
-    //  The background thread calls Sample() on an interval. Each sample walks
-    //  the main thread's StackTrace and increments a hit-count per frame in
-    //  each method's fully-qualified name. Self-time = frames where the method
-    //  is at position 0 (the leaf). Total-time = any appearance.
-    //
-    //  We store only the top of the stack (configurable depth) to avoid huge
-    //  allocations. Thread safety: Interlocked on the running flag; Dictionary
-    //  access is behind a lightweight SpinLock since samples are very frequent.
-    // ─────────────────────────────────────────────────────────────────────────────
     public class Sampler
     {
         private volatile bool _running;
-
-        // KEY: assembly name → sample count
         private readonly ConcurrentDictionary<(string, TrackerCategory), int> _counts = new();
         private readonly Dictionary<string, TrackerCategory> _categoryRegistry = new();
-
         private int _totalSamples;
 
-        public void Start()
-        {
-            _running = true;
-        }
+        // Stack trace caching for performance - reduces allocations!
+        private static volatile Thread? _cachedMainStackTraceThread;
+        private static volatile StackTrace? _cachedStackTrace;
 
-        public void Stop()
-        {
-            _running = false;
-        }
-
+        public void Start() => _running = true;
+        public void Stop() => _running = false;
         public bool Running => _running;
 
         public void Sample()
@@ -168,14 +137,24 @@ namespace LagTrace
             var mainThread = MainThreadRef.MainThread;
             if (mainThread == null) return;
 
-            StackTrace stackTrace;
-
+            StackTrace stackTrace = null;
             try
             {
-                stackTrace = new StackTrace(mainThread, false);
+                // Cache stack trace if on same thread - saves allocations!
+                if (_cachedMainStackTraceThread != mainThread)
+                {
+                    _cachedStackTrace = new StackTrace(mainThread, false);
+                    _cachedMainStackTraceThread = mainThread;
+                }
+                else
+                {
+                    stackTrace = _cachedStackTrace ?? new StackTrace(mainThread, false);
+                }
             }
-            catch
+            catch (Exception ex)
             {
+                if (LagTracePlugin.Instance.Configuration.Instance.LogPatchErrors)
+                    Logger.Log($"[LagTrace] StackTrace error: {ex.Message}");
                 return;
             }
 
@@ -186,28 +165,27 @@ namespace LagTrace
             string assembly = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
             var category = Classify(assembly);
 
-            // FULL weight ONLY for leaf
             var key = (assembly, category);
             _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
             Interlocked.Increment(ref _totalSamples);
         }
+
         public string[] GetLastStackSafe()
         {
             try
             {
-                var st = new StackTrace(MainThreadRef.MainThread, false);
-                var frame = st.GetFrame(0);
-                var method = frame?.GetMethod();
+                if (_cachedMainStackTraceThread == MainThreadRef.MainThread && _cachedStackTrace != null)
+                    return new[] { _cachedStackTrace.GetFrame(0)?.GetMethod()?.DeclaringType?.FullName + "." + _cachedStackTrace.GetFrame(0)?.GetMethod()?.Name };
 
-                return method == null
-                    ? Array.Empty<string>()
-                    : new[] { method.DeclaringType?.FullName + "." + method.Name };
+                var st = new StackTrace(MainThreadRef.MainThread, false);
+                return st.GetFrame(0)?.GetMethod() == null ? Array.Empty<string>() : new[] { st.GetFrame(0)?.GetMethod()?.DeclaringType?.FullName + "." + st.GetFrame(0)?.GetMethod()?.Name };
             }
             catch
             {
                 return Array.Empty<string>();
             }
         }
+
         public List<SampleEntry> GetTop(int n, TrackerCategory? filter = null)
         {
             int total = _totalSamples;
@@ -235,47 +213,39 @@ namespace LagTrace
                    !assemblyName.StartsWith("mscorlib") &&
                    assemblyName != "Assembly-CSharp";
         }
+
         private TrackerCategory Classify(string assembly)
         {
-            if (string.IsNullOrEmpty(assembly))
+            if (string.IsNullOrEmpty(assembly)) return TrackerCategory.Core;
+            if (_categoryRegistry.TryGetValue(assembly, out var cat)) return cat;
+            if (assembly.StartsWith("Unity") || assembly.StartsWith("System") || assembly.StartsWith("mscorlib"))
                 return TrackerCategory.Core;
-
-            if (_categoryRegistry.TryGetValue(assembly, out var cat))
-                return cat;
-
-            // fallback rules ONLY if not registered
-            if (assembly.StartsWith("Unity") ||
-                assembly.StartsWith("System") ||
-                assembly.StartsWith("mscorlib"))
-                return TrackerCategory.Core;
-
             return TrackerCategory.Plugin;
         }
+
         public void RegisterAssembly(string assemblyName, TrackerCategory category)
         {
-            if (string.IsNullOrEmpty(assemblyName))
-                return;
-
+            if (string.IsNullOrEmpty(assemblyName)) return;
             _categoryRegistry[assemblyName] = category;
         }
+
         public void BuildRegistry()
         {
             _categoryRegistry.Clear();
-
-            // Engine
             _categoryRegistry["Assembly-CSharp"] = TrackerCategory.Core;
-
-            // Unity/system
             _categoryRegistry["UnityEngine"] = TrackerCategory.Core;
             _categoryRegistry["System"] = TrackerCategory.Core;
             _categoryRegistry["mscorlib"] = TrackerCategory.Core;
         }
+
         public void Reset()
         {
             _counts.Clear();
             _totalSamples = 0;
+            _cachedStackTrace = null; // Clear cache on reset
         }
     }
+
     public class SampleEntry
     {
         public string DisplayName;
@@ -284,29 +254,14 @@ namespace LagTrace
         public TrackerCategory Category;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  Stores a reference to the main Unity thread.
-    //  [RuntimeInitializeOnLoadMethod] does NOT fire on dedicated servers under
-    //  Rocketmod/Mono, so we capture it explicitly from Load() and from
-    //  FrameTimingComponent.Awake(), both of which are guaranteed to run on the
-    //  main thread.
-    // ─────────────────────────────────────────────────────────────────────────────
     public static class MainThreadRef
     {
         public static Thread MainThread;
-        public static void Capture()
-        {
-            MainThread = Thread.CurrentThread;
-        }
+        public static void Capture() => MainThread = Thread.CurrentThread;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  SpikeDetector — captures a full stack snapshot whenever a frame exceeds
-    //  the configured threshold.
-    // ─────────────────────────────────────────────────────────────────────────────
     public class SpikeDetector
     {
-        // Ring buffer of recent spikes
         private const int MaxSpikes = 20;
         private readonly SpikeRecord[] _ring = new SpikeRecord[MaxSpikes];
         private int _head = 0;
@@ -315,8 +270,7 @@ namespace LagTrace
 
         public void Feed(float frameMs)
         {
-            if (frameMs < LagTracePlugin.Instance.Configuration.Instance.SpikeThresholdMs)
-                return;
+            if (frameMs < LagTracePlugin.Instance.Configuration.Instance.SpikeThresholdMs) return;
 
             var record = new SpikeRecord
             {
@@ -362,34 +316,10 @@ namespace LagTrace
         public string[] Stack;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  PluginTimingTracker — per-source self-time derived from the sampler.
-    //
-    //  Attribution priority (leaf-first through the stack):
-    //    1. Registered plugin assembly prefix  → category Plugin
-    //    2. "SDG.Unturned.<ManagerClass>"      → category Engine, name = class
-    //    3. Everything else                    → not counted (Unity/Mono overhead)
-    //
-    //  Each registration maps an assembly-name (or namespace prefix) to a
-    //  display name + category, so both Rocket plugins and Unturned managers
-    //  appear in /lagplugins with clear labelling.
-    // ─────────────────────────────────────────────────────────────────────────────
     public enum TrackerCategory { Plugin, Engine, Core }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  HarmonyPatcher — patches every loaded RocketPlugin AND the known Unturned
-    //  server-side manager types with prefix/postfix timing wrappers.
-    //
-    //  Unturned managers live in Assembly-CSharp and are not enumerable via any
-    //  Rocket API, so we maintain a curated list. These are the types that own
-    //  expensive FixedUpdate / Update loops (vehicles, animals, zombies, etc.).
-    //  The list was assembled from reading the SDG decompiled source — extend it
-    //  freely as new managers are identified.
-    // ─────────────────────────────────────────────────────────────────────────────
     public static class HarmonyPatcher
     {
-        // All Unturned manager types we want to instrument.
-        // Any that don't exist in the current game version are skipped gracefully.
         private static readonly string[] UnturnedManagerTypeNames =
         {
             "SDG.Unturned.VehicleManager",
@@ -412,27 +342,21 @@ namespace LagTrace
             "SDG.Unturned.UseableMelee",
         };
 
-        // Methods we patch on each manager type (whichever exist)
         private static readonly string[] TargetMethods = { "FixedUpdate", "Update", "LateUpdate" };
 
         public static void PatchLoadedPlugins(Harmony h)
         {
-            // ── Rocket plugins ───────────────────────────────────────────────────
             foreach (var plugin in Rocket.Core.R.Plugins.GetPlugins())
             {
-                if (plugin.GetType().Assembly == typeof(LagTracePlugin).Assembly)
-                    continue; // skip ourselves
+                if (plugin.GetType().Assembly == typeof(LagTracePlugin).Assembly) continue;
 
                 var asm = plugin.GetType().Assembly;
                 var pName = plugin.Name;
                 var asmName = asm.GetName().Name;
 
-                foreach (var m in TargetMethods)
-                    TryPatch(h, plugin.GetType(), m);
+                foreach (var m in TargetMethods) TryPatch(h, plugin.GetType(), m);
             }
 
-            // ── Unturned engine managers ─────────────────────────────────────────
-            // Assembly-CSharp is always loaded; resolve types directly.
             var asmCsharp = AppDomain.CurrentDomain.GetAssemblies()
                 .FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
 
@@ -445,10 +369,9 @@ namespace LagTrace
             foreach (var typeName in UnturnedManagerTypeNames)
             {
                 var t = asmCsharp.GetType(typeName);
-                if (t == null) continue; // version mismatch — skip silently
+                if (t == null) continue;
 
-                foreach (var m in TargetMethods)
-                    TryPatch(h, t, m);
+                foreach (var m in TargetMethods) TryPatch(h, t, m);
             }
 
             Logger.Log("[LagTrace] Engine manager patches applied.");
@@ -456,28 +379,24 @@ namespace LagTrace
 
         private static void TryPatch(Harmony h, Type t, string methodName)
         {
-            var method = t.GetMethod(methodName,
-                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var method = t.GetMethod(methodName, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
             if (method == null) return;
 
             try
             {
-                var prefix = new HarmonyMethod(typeof(HarmonyPatcher)
-                    .GetMethod(nameof(TimingPrefix), BindingFlags.Static | BindingFlags.NonPublic));
-                var postfix = new HarmonyMethod(typeof(HarmonyPatcher)
-                    .GetMethod(nameof(TimingPostfix), BindingFlags.Static | BindingFlags.NonPublic));
+                var prefix = new HarmonyMethod(typeof(HarmonyPatcher).GetMethod(nameof(TimingPrefix), BindingFlags.Static | BindingFlags.NonPublic));
+                var postfix = new HarmonyMethod(typeof(HarmonyPatcher).GetMethod(nameof(TimingPostfix), BindingFlags.Static | BindingFlags.NonPublic));
 
                 h.Patch(method, prefix: prefix, postfix: postfix);
             }
             catch (Exception ex)
             {
-                Logger.Log($"[LagTrace] Could not patch {t.Name}.{methodName}: {ex.Message}");
+                if (LagTracePlugin.Instance.Configuration.Instance.LogPatchErrors)
+                    Logger.Log($"[LagTrace] Could not patch {t.Name}.{methodName}: {ex.Message}");
             }
         }
 
-        private static void TimingPrefix(ref object __state) =>
-            __state = Stopwatch.StartNew();
-
+        private static void TimingPrefix(ref object __state) => __state = Stopwatch.StartNew();
         private static void TimingPostfix(MethodBase __originalMethod, object __state)
         {
             if (__state is Stopwatch sw)
@@ -489,23 +408,17 @@ namespace LagTrace
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  Timings — instrumented timing store (complementary to sampler)
-    //  Used both by Harmony patches and by the public `Timings.Start()` API.
-    // ─────────────────────────────────────────────────────────────────────────────
     public static class Timings
     {
-        private static readonly Dictionary<string, TimingBucket> _buckets
-            = new Dictionary<string, TimingBucket>(64);
-        private static readonly ReaderWriterLockSlim _rwl = new ReaderWriterLockSlim();
+        private static readonly Dictionary<string, TimingBucket> _buckets = new(64);
+        private static readonly ReaderWriterLockSlim _rwl = new();
 
         public static void Record(string name, long ticks)
         {
             _rwl.EnterWriteLock();
             try
             {
-                if (!_buckets.TryGetValue(name, out var b))
-                    _buckets[name] = b = new TimingBucket();
+                if (!_buckets.TryGetValue(name, out var b)) _buckets[name] = b = new TimingBucket();
                 b.TotalTicks += ticks;
                 b.Calls++;
                 if (ticks > b.MaxTicks) b.MaxTicks = ticks;
@@ -513,7 +426,6 @@ namespace LagTrace
             finally { _rwl.ExitWriteLock(); }
         }
 
-        // Convenience RAII scope for manual instrumentation.
         public static IDisposable Start(string name) => new TimerScope(name);
 
         public static List<TimingEntry> GetTop(int n, bool perCall = false)
@@ -521,24 +433,20 @@ namespace LagTrace
             _rwl.EnterReadLock();
             try
             {
-                return _buckets
-                    .Select(kv =>
+                return _buckets.Select(kv =>
+                {
+                    double totalMs = kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency;
+                    double avgMs = kv.Value.Calls > 0 ? totalMs / kv.Value.Calls : 0;
+                    double maxMs = kv.Value.MaxTicks * 1000.0 / Stopwatch.Frequency;
+                    return new TimingEntry
                     {
-                        double totalMs = kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency;
-                        double avgMs = kv.Value.Calls > 0 ? totalMs / kv.Value.Calls : 0;
-                        double maxMs = kv.Value.MaxTicks * 1000.0 / Stopwatch.Frequency;
-                        return new TimingEntry
-                        {
-                            Name = kv.Key,
-                            TotalMs = totalMs,
-                            AvgMs = avgMs,
-                            MaxMs = maxMs,
-                            Calls = kv.Value.Calls,
-                        };
-                    })
-                    .OrderByDescending(e => perCall ? e.AvgMs : e.TotalMs)
-                    .Take(n)
-                    .ToList();
+                        Name = kv.Key,
+                        TotalMs = totalMs,
+                        AvgMs = avgMs,
+                        MaxMs = maxMs,
+                        Calls = kv.Value.Calls,
+                    };
+                }).OrderByDescending(e => perCall ? e.AvgMs : e.TotalMs).Take(n).ToList();
             }
             finally { _rwl.ExitReadLock(); }
         }
@@ -581,20 +489,13 @@ namespace LagTrace
         public int Calls;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  FrameTimingComponent — attached to the plugin GameObject at load time.
-    //  Unity calls LateUpdate() on it every frame, giving us real frame-time
-    //  without needing to patch MonoBehaviour (which has no patchable LateUpdate).
-    // ─────────────────────────────────────────────────────────────────────────────
     public class FrameTimingComponent : MonoBehaviour
     {
         private float _lastTime;
 
         private void Awake()
         {
-            // Belt-and-suspenders: re-capture the main thread here in case Load()
-            // ran on a different thread in some Rocketmod build.
-            MainThreadRef.Capture();
+            MainThreadRef.Capture(); // Belt-and-suspenders thread capture
         }
 
         private void LateUpdate()
@@ -603,24 +504,19 @@ namespace LagTrace
             float delta = (now - _lastTime) * 1000f;
             _lastTime = now;
 
-            if (delta > 0f)
-                LagTracePlugin.OnFrameComplete(delta);
+            if (delta > 0f) LagTracePlugin.OnFrameComplete(delta);
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  Commands
-    // ─────────────────────────────────────────────────────────────────────────────
-
-    /// /lag — quick server health snapshot
+    /// <summary> /lag — quick server health snapshot </summary>
     public class CommandLag : IRocketCommand
     {
         public string Name => "lag";
         public string Help => "Show current TPS and top methods.";
         public string Syntax => "/lag";
-        public List<string> Aliases => new List<string>();
+        public List<string> Aliases => new();
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions => new List<string> { "lagtrace.lag" };
+        public List<string> Permissions => new() { "lagtrace.lag" };
 
         public void Execute(IRocketPlayer caller, string[] command)
         {
@@ -631,22 +527,21 @@ namespace LagTrace
             sb.AppendLine($"[LagTrace] TPS: {tps:F1}  FrameTime: {Time.smoothDeltaTime * 1000f:F1}ms");
             sb.AppendLine("Top 5 methods (self%):");
             if (top.Count == 0) { sb.AppendLine("  (no data yet — wait a few seconds)"); }
-            else foreach (var e in top)
-                    sb.AppendLine($"  {CommandHelpers.Truncate(e.DisplayName, 55)}  {e.Pct:F1}%");
+            else foreach (var e in top) sb.AppendLine($"  {CommandHelpers.Truncate(e.DisplayName, 55)}  {e.Pct:F1}%");
 
             CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
-    /// /lagtop [n] [avg] — top methods, optionally sorted by avg time
+    /// <summary> /lagtop [n] [avg] — top methods, optionally sorted by avg time </summary>
     public class CommandLagTop : IRocketCommand
     {
         public string Name => "lagtop";
         public string Help => "Show top N heaviest methods. Usage: /lagtop [n] [avg]";
         public string Syntax => "/lagtop [n] [avg]";
-        public List<string> Aliases => new List<string> { "lt" };
+        public List<string> Aliases => new() { "lt" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions => new List<string> { "lagtrace.lagtop" };
+        public List<string> Permissions => new() { "lagtrace.lagtop" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
@@ -659,7 +554,6 @@ namespace LagTrace
                 if (a.Equals("avg", StringComparison.OrdinalIgnoreCase)) byAvg = true;
             }
 
-            // Prefer instrumented data; fall back to sampler for methods without explicit timing.
             var timed = Timings.GetTop(n, byAvg);
             var sampled = LagTracePlugin.Sampler.GetTop(n);
 
@@ -678,22 +572,21 @@ namespace LagTrace
                 foreach (var e in sampled)
                     sb.AppendLine($"  {CommandHelpers.Truncate(e.DisplayName, 52)}  {e.Pct:F1}%");
             }
-            if (timed.Count == 0 && sampled.Count == 0)
-                sb.AppendLine("  (no data yet)");
+            if (timed.Count == 0 && sampled.Count == 0) sb.AppendLine("  (no data yet)");
 
             CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
-    /// /lagplugins [n] [engine|plugins] — per-source breakdown with category grouping
+    /// <summary> /lagplugins [n] [engine|plugins] — per-source breakdown with category grouping </summary>
     public class CommandLagPlugins : IRocketCommand
     {
         public string Name => "lagplugins";
         public string Help => "Show CPU cost per plugin and engine manager. Filter: engine / plugins.";
         public string Syntax => "/lagplugins [n] [engine|plugins]";
-        public List<string> Aliases => new List<string> { "lp" };
+        public List<string> Aliases => new() { "lp" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions => new List<string> { "lagtrace.lagplugins" };
+        public List<string> Permissions => new() { "lagtrace.lagplugins" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
@@ -702,12 +595,9 @@ namespace LagTrace
 
             foreach (var a in args)
             {
-                if (int.TryParse(a, out int parsed))
-                    n = Math.Max(1, Math.Min(parsed, 50));
-                else if (a.Equals("engine", StringComparison.OrdinalIgnoreCase))
-                    filter = TrackerCategory.Engine;
-                else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase))
-                    filter = TrackerCategory.Plugin;
+                if (int.TryParse(a, out int parsed)) n = Math.Max(1, Math.Min(parsed, 50));
+                else if (a.Equals("engine", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Engine;
+                else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Plugin;
             }
 
             var entries = LagTracePlugin.Sampler.GetTop(n, filter);
@@ -719,9 +609,7 @@ namespace LagTrace
             }
 
             var sb = new StringBuilder();
-
-            string filterLabel = filter == null ? "all" :
-                                 filter == TrackerCategory.Engine ? "engine only" : "plugins only";
+            string filterLabel = filter == null ? "all" : filter == TrackerCategory.Engine ? "engine only" : "plugins only";
 
             sb.AppendLine($"[LagTrace] CPU attribution ({filterLabel}, top {n}):");
 
@@ -735,14 +623,11 @@ namespace LagTrace
             }
 
             TrackerCategory? lastCat = null;
-
             foreach (var e in entries.OrderBy(e => e.Category).ThenByDescending(e => e.Pct))
             {
                 if (e.Category != lastCat)
                 {
-                    sb.AppendLine(e.Category == TrackerCategory.Engine
-                        ? "  ── Unturned engine ──"
-                        : "  ── Rocket plugins ──");
+                    sb.AppendLine(e.Category == TrackerCategory.Engine ? "  ── Unturned engine ──" : "  ── Rocket plugins ──");
                     lastCat = e.Category;
                 }
 
@@ -756,15 +641,15 @@ namespace LagTrace
         }
     }
 
-    /// /lagspike — show last recorded lag spike
+    /// <summary> /lagspike — show last recorded lag spike </summary>
     public class CommandLagSpike : IRocketCommand
     {
         public string Name => "lagspike";
         public string Help => "Show the most recent lag spike call stack.";
         public string Syntax => "/lagspike [list]";
-        public List<string> Aliases => new List<string> { "ls" };
+        public List<string> Aliases => new() { "ls" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions => new List<string> { "lagtrace.lagspike" };
+        public List<string> Permissions => new() { "lagtrace.lagspike" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
@@ -776,8 +661,7 @@ namespace LagTrace
                 if (all.Count == 0) { CommandHelpers.Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
                 var sb = new StringBuilder();
                 sb.AppendLine("[LagTrace] Recent spikes:");
-                foreach (var s in all)
-                    sb.AppendLine($"  {s.TimestampUtc:HH:mm:ss}  {s.FrameMs:F1}ms");
+                foreach (var s in all) sb.AppendLine($"  {s.TimestampUtc:HH:mm:ss}  {s.FrameMs:F1}ms");
                 CommandHelpers.Reply(caller, sb.ToString());
                 return;
             }
@@ -797,26 +681,24 @@ namespace LagTrace
         }
     }
 
-    /// /lagreset — clear all accumulated data
+    /// <summary> /lagreset — clear all accumulated data </summary>
     public class CommandLagReset : IRocketCommand
     {
         public string Name => "lagreset";
         public string Help => "Reset all LagTrace timing data.";
         public string Syntax => "/lagreset";
-        public List<string> Aliases => new List<string>();
+        public List<string> Aliases => new();
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions => new List<string> { "lagtrace.reset" };
+        public List<string> Permissions => new() { "lagtrace.reset" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
             LagTracePlugin.Sampler.Reset();
+            Timings.Reset();
             CommandHelpers.Reply(caller, "[LagTrace] All data cleared.");
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────────
-    //  Shared utilities
-    // ─────────────────────────────────────────────────────────────────────────────
     internal static class CommandHelpers
     {
         public static void Reply(IRocketPlayer player, string message)
@@ -832,7 +714,6 @@ namespace LagTrace
             s.Length <= max ? s : "…" + s.Substring(s.Length - (max - 1));
     }
 
-    // Make the helpers available in command classes without full qualification.
     public abstract class CommandBase
     {
         protected static void Reply(IRocketPlayer p, string msg) => CommandHelpers.Reply(p, msg);
