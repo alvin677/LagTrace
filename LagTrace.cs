@@ -49,6 +49,7 @@ namespace LagTrace
             HarmonyPatcher.PatchLoadedPlugins(_harmony);
 
             // Start background sampler (samples main thread stack every N ms)
+            Sampler.BuildRegistry();
             Sampler.Start();
             _samplerThread = new Thread(SamplerLoop)
             {
@@ -144,6 +145,7 @@ namespace LagTrace
 
         // KEY: assembly name → sample count
         private readonly ConcurrentDictionary<string, int> _counts = new();
+        private readonly Dictionary<string, TrackerCategory> _categoryRegistry = new();
 
         private int _totalSamples;
 
@@ -187,7 +189,7 @@ namespace LagTrace
 
                 string assembly = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
 
-                var category = Classify(assembly, method);
+                var category = Classify(assembly);
 
                 _counts.AddOrUpdate(assembly, 1, (_, v) => v + 1);
                 Interlocked.Increment(ref _totalSamples);
@@ -229,29 +231,41 @@ namespace LagTrace
                    !assemblyName.StartsWith("mscorlib") &&
                    assemblyName != "Assembly-CSharp";
         }
-        private TrackerCategory Classify(string assembly, MethodBase method)
+        private TrackerCategory Classify(string assembly)
         {
             if (string.IsNullOrEmpty(assembly))
                 return TrackerCategory.Core;
 
-            // Engine (Unturned)
-            if (method?.DeclaringType?.FullName?.StartsWith("SDG.Unturned") == true)
-                return TrackerCategory.Engine;
+            if (_categoryRegistry.TryGetValue(assembly, out var cat))
+                return cat;
 
-            // Core game assembly
-            if (assembly == "Assembly-CSharp")
-                return TrackerCategory.Core;
-
-            // Unity / system noise → treat as core (ignore later if needed)
+            // fallback rules ONLY if not registered
             if (assembly.StartsWith("Unity") ||
                 assembly.StartsWith("System") ||
                 assembly.StartsWith("mscorlib"))
                 return TrackerCategory.Core;
 
-            // Everything else = plugin
             return TrackerCategory.Plugin;
         }
+        public void RegisterAssembly(string assemblyName, TrackerCategory category)
+        {
+            if (string.IsNullOrEmpty(assemblyName))
+                return;
 
+            _categoryRegistry[assemblyName] = category;
+        }
+        public void BuildRegistry()
+        {
+            _categoryRegistry.Clear();
+
+            // Engine
+            _categoryRegistry["Assembly-CSharp"] = TrackerCategory.Core;
+
+            // Unity/system
+            _categoryRegistry["UnityEngine"] = TrackerCategory.Core;
+            _categoryRegistry["System"] = TrackerCategory.Core;
+            _categoryRegistry["mscorlib"] = TrackerCategory.Core;
+        }
         public void Reset()
         {
             _counts.Clear();
