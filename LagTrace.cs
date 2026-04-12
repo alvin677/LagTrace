@@ -161,20 +161,35 @@ namespace LagTrace
 
         public void Sample()
         {
+            if (!_running) return;
+
             var mainThread = MainThreadRef.MainThread;
             if (mainThread == null) return;
 
-            var stackTrace = new StackTrace(mainThread, false);
-            if (stackTrace.FrameCount == 0) return;
+            StackTrace stackTrace;
 
-            var frame = stackTrace.GetFrame(0);
-            var method = frame?.GetMethod();
-            if (method == null) return;
+            try
+            {
+                stackTrace = new StackTrace(mainThread, false);
+            }
+            catch
+            {
+                return;
+            }
 
-            string key = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
+            int maxFrames = Math.Min(stackTrace.FrameCount, 8);
 
-            _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
-            Interlocked.Increment(ref _totalSamples);
+            for (int i = 0; i < maxFrames; i++)
+            {
+                var frame = stackTrace.GetFrame(i);
+                var method = frame?.GetMethod();
+                if (method == null) continue;
+
+                string assembly = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
+
+                _counts.AddOrUpdate(assembly, 1, (_, v) => v + 1);
+                Interlocked.Increment(ref _totalSamples);
+            }
         }
 
         public List<SampleEntry> GetTop(int n, TrackerCategory? filter = null)
