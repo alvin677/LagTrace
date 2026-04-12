@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <AssemblyName>LagTrace</AssemblyName>
+    <RootNamespace>LagTrace</RootNamespace>
+    <OutputType>Library</OutputType>
+    <LangVersion>9</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <!-- Adjust paths to match your local Unturned / Rocket installation -->
+  <ItemGroup>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(UnturnedDir)\Unturned_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Rocket.API">
+      <HintPath>$(UnturnedDir)\Modules\Rocket.Unturned\Rocket.API.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Rocket.Core">
+      <HintPath>$(UnturnedDir)\Modules\Rocket.Unturned\Rocket.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Rocket.Unturned">
+      <HintPath>$(UnturnedDir)\Modules\Rocket.Unturned\Rocket.Unturned.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(UnturnedDir)\Unturned_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(UnturnedDir)\Unturned_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- Harmony 2.x — include the DLL in your plugin folder -->
+    <Reference Include="0Harmony">
+      <HintPath>lib\0Harmony.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LagTraceConfig xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <!-- How often the background sampler takes a stack snapshot (milliseconds).
+       Lower = more accurate; 5ms is a good balance on most servers. -->
+  <SampleIntervalMs>5</SampleIntervalMs>
+
+  <!-- Reporting window in seconds. Timings accumulate across this window.
+       /lagtop will show the aggregated data from the start (or last /lagreset). -->
+  <WindowSeconds>60</WindowSeconds>
+
+  <!-- A frame longer than this (ms) will be recorded as a spike. -->
+  <SpikeThresholdMs>50</SpikeThresholdMs>
+
+  <!-- Print top-10 methods to the console every WindowSeconds automatically. -->
+  <AutoPrint>false</AutoPrint>
+
+  <!-- Default row count for /lagtop and /lagplugins. -->
+  <TopN>10</TopN>
+</LagTraceConfig>
