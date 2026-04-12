@@ -11,7 +11,6 @@ using Rocket.API;
 using Rocket.Core.Logging;
 using Rocket.Core.Plugins;
 using UnityEngine;
-using Logger = Rocket.Core.Logging.Logger;
 
 namespace LagTrace
 {
@@ -35,7 +34,11 @@ namespace LagTrace
             Instance = this;
 
             _harmony = new Harmony("com.lagtrace");
-            _harmony.PatchAll(Assembly.GetExecutingAssembly());
+            // No attribute-based [HarmonyPatch] classes remain — PatchAll is not called.
+            // This avoids Harmony trying to patch unpatchable Unity magic methods.
+
+            // Attach frame-timing component (replaces the old MonoBehaviour LateUpdate patch).
+            gameObject.AddComponent<FrameTimingComponent>();
 
             // Patch all RocketPlugin.FixedUpdate / Update that are currently loaded
             HarmonyPatcher.PatchLoadedPlugins(_harmony);
@@ -45,7 +48,7 @@ namespace LagTrace
             {
                 Name       = "LagTrace-Sampler",
                 IsBackground = true,
-                Priority   = System.Threading.ThreadPriority.BelowNormal
+                Priority   = ThreadPriority.BelowNormal
             };
             _samplerThread.Start();
 
@@ -90,7 +93,7 @@ namespace LagTrace
         }
 
         // ── Unity frame hook (patches applied before this) ─────────────────────
-        // Called by FrameTimingPatch every LateUpdate to feed spike detector.
+        // Called by FrameTimingComponent every LateUpdate to feed spike detector.
         public static void OnFrameComplete(float deltaMs)
         {
             Spikes.Feed(deltaMs);
@@ -653,21 +656,22 @@ namespace LagTrace
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  Harmony patches
+    //  FrameTimingComponent — attached to the plugin GameObject at load time.
+    //  Unity calls LateUpdate() on it every frame, giving us real frame-time
+    //  without needing to patch MonoBehaviour (which has no patchable LateUpdate).
     // ─────────────────────────────────────────────────────────────────────────────
-
-    // Measure each LateUpdate so we can report frame-time to the spike detector.
-    [HarmonyPatch(typeof(MonoBehaviour), "LateUpdate")]
-    public class FrameTimingPatch
+    public class FrameTimingComponent : MonoBehaviour
     {
-        private static float _lastTime;
+        private float _lastTime;
 
-        static void Prefix() => _lastTime = Time.realtimeSinceStartup;
-
-        static void Postfix()
+        private void LateUpdate()
         {
-            float delta = (Time.realtimeSinceStartup - _lastTime) * 1000f;
-            LagTracePlugin.OnFrameComplete(delta);
+            float now   = Time.realtimeSinceStartup;
+            float delta = (now - _lastTime) * 1000f;
+            _lastTime   = now;
+
+            if (delta > 0f)
+                LagTracePlugin.OnFrameComplete(delta);
         }
     }
 
@@ -695,9 +699,9 @@ namespace LagTrace
             sb.AppendLine("Top 5 methods (self%):");
             if (top.Count == 0) { sb.AppendLine("  (no data yet — wait a few seconds)"); }
             else foreach (var e in top)
-                sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
+                sb.AppendLine($"  {Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
 
-            CommandHelpers.Reply(caller, sb.ToString());
+            Reply(caller, sb.ToString());
         }
     }
 
@@ -733,18 +737,18 @@ namespace LagTrace
             {
                 sb.AppendLine("  ── Instrumented (patched methods) ──");
                 foreach (var e in timed)
-                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 48)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  ×{e.Calls}");
+                    sb.AppendLine($"  {Truncate(e.Name, 48)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  ×{e.Calls}");
             }
             if (sampled.Count > 0)
             {
                 sb.AppendLine("  ── Sampler (all code) ──");
                 foreach (var e in sampled)
-                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 52)}  {e.SelfPct:F1}%");
+                    sb.AppendLine($"  {Truncate(e.Name, 52)}  {e.SelfPct:F1}%");
             }
             if (timed.Count == 0 && sampled.Count == 0)
                 sb.AppendLine("  (no data yet)");
 
-            CommandHelpers.Reply(caller, sb.ToString());
+            Reply(caller, sb.ToString());
         }
     }
 
@@ -779,7 +783,7 @@ namespace LagTrace
 
             if (entries.Count == 0)
             {
-                CommandHelpers.Reply(caller, "[LagTrace] No attribution data yet — wait a few seconds.");
+                Reply(caller, "[LagTrace] No attribution data yet — wait a few seconds.");
                 return;
             }
 
@@ -817,10 +821,10 @@ namespace LagTrace
                 // Bar: 20 chars wide, filled proportional to pct (capped at 100%)
                 int filled = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0); // 1 char = 5%
                 string bar = new string('█', filled) + new string('░', 20 - filled);
-                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {CommandHelpers.Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
+                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
             }
 
-            CommandHelpers.Reply(caller, sb.ToString());
+            Reply(caller, sb.ToString());
         }
     }
 
@@ -841,27 +845,27 @@ namespace LagTrace
             if (list)
             {
                 var all = LagTracePlugin.Spikes.GetAll();
-                if (all.Count == 0) { CommandHelpers.Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
+                if (all.Count == 0) { Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
                 var sb = new StringBuilder();
                 sb.AppendLine("[LagTrace] Recent spikes:");
                 foreach (var s in all)
                     sb.AppendLine($"  {s.TimestampUtc:HH:mm:ss}  {s.FrameMs:F1}ms");
-                CommandHelpers.Reply(caller, sb.ToString());
+                Reply(caller, sb.ToString());
                 return;
             }
 
             var spike = LagTracePlugin.Spikes.GetLast();
-            if (spike == null) { CommandHelpers.Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
+            if (spike == null) { Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
 
             var out2 = new StringBuilder();
             out2.AppendLine($"[LagTrace] Last spike at {spike.TimestampUtc:HH:mm:ss} UTC — {spike.FrameMs:F1}ms");
             out2.AppendLine("  Call stack (top = leaf):");
             int shown = Math.Min(spike.Stack.Length, 20);
             for (int i = 0; i < shown; i++)
-                out2.AppendLine($"  [{i,2}] {CommandHelpers.Truncate(spike.Stack[i], 70)}");
+                out2.AppendLine($"  [{i,2}] {Truncate(spike.Stack[i], 70)}");
             if (spike.Stack.Length > shown)
                 out2.AppendLine($"  ... and {spike.Stack.Length - shown} more frames");
-            CommandHelpers.Reply(caller, out2.ToString());
+            Reply(caller, out2.ToString());
         }
     }
 
@@ -880,7 +884,7 @@ namespace LagTrace
             Timings.Reset();
             LagTracePlugin.Sampler.Reset();
             LagTracePlugin.PluginTracker.Reset();
-            CommandHelpers.Reply(caller, "[LagTrace] All data cleared.");
+            Reply(caller, "[LagTrace] All data cleared.");
         }
     }
 
@@ -895,7 +899,9 @@ namespace LagTrace
                 Logger.Log(message);
             else
                 Rocket.Core.Utils.TaskDispatcher.QueueOnMainThread(() =>
-                    Rocket.Unturned.Chat.UnturnedChat.Say(player, message, UnityEngine.Color.cyan));
+                    ((SDG.Unturned.SteamPlayer)
+                        ((Rocket.Unturned.Player.UnturnedPlayer)player).SteamPlayer())
+                        ?.sendChat(message, UnityEngine.Color.cyan));
         }
 
         public static string Truncate(string s, int max) =>
