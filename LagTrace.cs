@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using HarmonyLib;
@@ -32,10 +33,6 @@ namespace LagTrace
         protected override void Load()
         {
             Instance = this;
-
-            // Load() is always called on the Unity main thread — capture it here
-            // so the sampler has a valid target before its thread starts.
-            MainThreadRef.Capture();
 
             _harmony = new Harmony("com.lagtrace");
             // No attribute-based [HarmonyPatch] classes remain — PatchAll is not called.
@@ -255,17 +252,14 @@ namespace LagTrace
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  Stores a reference to the main Unity thread.
-    //  [RuntimeInitializeOnLoadMethod] does NOT fire on dedicated servers under
-    //  Rocketmod/Mono, so we capture it explicitly from Load() and from
-    //  FrameTimingComponent.Awake(), both of which are guaranteed to run on the
-    //  main thread.
+    //  Set from a MonoBehaviour Awake() that runs on startup.
     // ─────────────────────────────────────────────────────────────────────────────
     public static class MainThreadRef
     {
         public static Thread Thread { get; private set; }
 
-        /// Call from any method guaranteed to run on the main thread.
-        public static void Capture() => Thread = System.Threading.Thread.CurrentThread;
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        private static void Capture() => Thread = System.Threading.Thread.CurrentThread;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -670,13 +664,6 @@ namespace LagTrace
     {
         private float _lastTime;
 
-        private void Awake()
-        {
-            // Belt-and-suspenders: re-capture the main thread here in case Load()
-            // ran on a different thread in some Rocketmod build.
-            MainThreadRef.Capture();
-        }
-
         private void LateUpdate()
         {
             float now = Time.realtimeSinceStartup;
@@ -685,13 +672,6 @@ namespace LagTrace
 
             if (delta > 0f)
                 LagTracePlugin.OnFrameComplete(delta);
-
-            // Feed plugin attribution from the sampler's last captured stack.
-            // Doing this here (main thread, every frame) is simpler and safer than
-            // calling Record() from inside the sampler thread.
-            var lastStack = LagTracePlugin.Sampler.GetLastStack();
-            if (lastStack.Length > 0)
-                LagTracePlugin.PluginTracker.Record(lastStack);
         }
     }
 
