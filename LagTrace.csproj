@@ -13,27 +13,27 @@
   <!-- Adjust paths to match your local Unturned / Rocket installation -->
   <ItemGroup>
     <Reference Include="Assembly-CSharp">
-      <HintPath>$(UnturnedDir)\Unturned_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <HintPath>lib\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Rocket.API">
-      <HintPath>$(UnturnedDir)\Modules\Rocket.Unturned\Rocket.API.dll</HintPath>
+      <HintPath>lib\Rocket.API.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Rocket.Core">
-      <HintPath>$(UnturnedDir)\Modules\Rocket.Unturned\Rocket.Core.dll</HintPath>
+      <HintPath>lib\Rocket.Core.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Rocket.Unturned">
-      <HintPath>$(UnturnedDir)\Modules\Rocket.Unturned\Rocket.Unturned.dll</HintPath>
+      <HintPath>lib\Rocket.Unturned.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>$(UnturnedDir)\Unturned_Data\Managed\UnityEngine.dll</HintPath>
+      <HintPath>lib\UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>$(UnturnedDir)\Unturned_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>lib\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- Harmony 2.x — include the DLL in your plugin folder -->
