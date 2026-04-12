@@ -187,8 +187,13 @@ namespace LagTrace
 
                 string assembly = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
 
+                var category = Classify(assembly, method);
+
                 _counts.AddOrUpdate(assembly, 1, (_, v) => v + 1);
                 Interlocked.Increment(ref _totalSamples);
+
+                // NEW: category tracking (we add next step storage later)
+                // for now we just prepare structure correctness
             }
         }
 
@@ -223,6 +228,28 @@ namespace LagTrace
                    !assemblyName.StartsWith("System") &&
                    !assemblyName.StartsWith("mscorlib") &&
                    assemblyName != "Assembly-CSharp";
+        }
+        private TrackerCategory Classify(string assembly, MethodBase method)
+        {
+            if (string.IsNullOrEmpty(assembly))
+                return TrackerCategory.Core;
+
+            // Engine (Unturned)
+            if (method?.DeclaringType?.FullName?.StartsWith("SDG.Unturned") == true)
+                return TrackerCategory.Engine;
+
+            // Core game assembly
+            if (assembly == "Assembly-CSharp")
+                return TrackerCategory.Core;
+
+            // Unity / system noise → treat as core (ignore later if needed)
+            if (assembly.StartsWith("Unity") ||
+                assembly.StartsWith("System") ||
+                assembly.StartsWith("mscorlib"))
+                return TrackerCategory.Core;
+
+            // Everything else = plugin
+            return TrackerCategory.Plugin;
         }
 
         public void Reset()
@@ -329,7 +356,7 @@ namespace LagTrace
     //  display name + category, so both Rocket plugins and Unturned managers
     //  appear in /lagplugins with clear labelling.
     // ─────────────────────────────────────────────────────────────────────────────
-    public enum TrackerCategory { Plugin, Engine }
+    public enum TrackerCategory { Plugin, Engine, Core }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  HarmonyPatcher — patches every loaded RocketPlugin AND the known Unturned
