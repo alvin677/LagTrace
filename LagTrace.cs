@@ -179,29 +179,35 @@ namespace LagTrace
                 return;
             }
 
-            int maxFrames = Math.Min(stackTrace.FrameCount, 8);
+            var frame = stackTrace.GetFrame(0);
+            var method = frame?.GetMethod();
+            if (method == null) return;
 
-            for (int i = 0; i < maxFrames; i++)
+            string assembly = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
+            var category = Classify(assembly);
+
+            // FULL weight ONLY for leaf
+            var key = (assembly, category);
+            _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
+            Interlocked.Increment(ref _totalSamples);
+        }
+        public string[] GetLastStackSafe()
+        {
+            try
             {
-                var frame = stackTrace.GetFrame(i);
+                var st = new StackTrace(MainThreadRef.MainThread, false);
+                var frame = st.GetFrame(0);
                 var method = frame?.GetMethod();
-                if (method == null) continue;
 
-                string assembly = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
-
-                var category = Classify(assembly);
-
-                // IMPORTANT: key includes category now
-                var key = (assembly, category);
-
-                _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
-                Interlocked.Increment(ref _totalSamples);
-
-                // NEW: category tracking (we add next step storage later)
-                // for now we just prepare structure correctness
+                return method == null
+                    ? Array.Empty<string>()
+                    : new[] { method.DeclaringType?.FullName + "." + method.Name };
+            }
+            catch
+            {
+                return Array.Empty<string>();
             }
         }
-
         public List<SampleEntry> GetTop(int n, TrackerCategory? filter = null)
         {
             int total = _totalSamples;
@@ -316,7 +322,7 @@ namespace LagTrace
             {
                 TimestampUtc = DateTime.UtcNow,
                 FrameMs = frameMs,
-                Stack = Array.Empty<string>(),
+                Stack = LagTracePlugin.Sampler.GetLastStackSafe()
             };
 
             lock (_lock)
