@@ -695,7 +695,7 @@ namespace LagTrace
             sb.AppendLine("Top 5 methods (self%):");
             if (top.Count == 0) { sb.AppendLine("  (no data yet — wait a few seconds)"); }
             else foreach (var e in top)
-                sb.AppendLine($"  {Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
+                sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
 
             CommandHelpers.Reply(caller, sb.ToString());
         }
@@ -733,13 +733,13 @@ namespace LagTrace
             {
                 sb.AppendLine("  ── Instrumented (patched methods) ──");
                 foreach (var e in timed)
-                    sb.AppendLine($"  {Truncate(e.Name, 48)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  ×{e.Calls}");
+                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 48)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  ×{e.Calls}");
             }
             if (sampled.Count > 0)
             {
                 sb.AppendLine("  ── Sampler (all code) ──");
                 foreach (var e in sampled)
-                    sb.AppendLine($"  {Truncate(e.Name, 52)}  {e.SelfPct:F1}%");
+                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 52)}  {e.SelfPct:F1}%");
             }
             if (timed.Count == 0 && sampled.Count == 0)
                 sb.AppendLine("  (no data yet)");
@@ -817,7 +817,7 @@ namespace LagTrace
                 // Bar: 20 chars wide, filled proportional to pct (capped at 100%)
                 int filled = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0); // 1 char = 5%
                 string bar = new string('█', filled) + new string('░', 20 - filled);
-                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
+                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {CommandHelpers.Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
             }
 
             CommandHelpers.Reply(caller, sb.ToString());
@@ -858,7 +858,7 @@ namespace LagTrace
             out2.AppendLine("  Call stack (top = leaf):");
             int shown = Math.Min(spike.Stack.Length, 20);
             for (int i = 0; i < shown; i++)
-                out2.AppendLine($"  [{i,2}] {Truncate(spike.Stack[i], 70)}");
+                out2.AppendLine($"  [{i,2}] {CommandHelpers.Truncate(spike.Stack[i], 70)}");
             if (spike.Stack.Length > shown)
                 out2.AppendLine($"  ... and {spike.Stack.Length - shown} more frames");
             CommandHelpers.Reply(caller, out2.ToString());
