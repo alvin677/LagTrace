@@ -11,6 +11,7 @@ using Rocket.API;
 using Rocket.Core.Logging;
 using Rocket.Core.Plugins;
 using UnityEngine;
+using Logger = Rocket.Core.Logging.Logger;
 
 namespace LagTrace
 {
@@ -44,7 +45,7 @@ namespace LagTrace
             {
                 Name       = "LagTrace-Sampler",
                 IsBackground = true,
-                Priority   = ThreadPriority.BelowNormal
+                Priority   = System.Threading.ThreadPriority.BelowNormal
             };
             _samplerThread.Start();
 
@@ -696,7 +697,7 @@ namespace LagTrace
             else foreach (var e in top)
                 sb.AppendLine($"  {Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
 
-            Reply(caller, sb.ToString());
+            CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
@@ -743,7 +744,7 @@ namespace LagTrace
             if (timed.Count == 0 && sampled.Count == 0)
                 sb.AppendLine("  (no data yet)");
 
-            Reply(caller, sb.ToString());
+            CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
@@ -778,7 +779,7 @@ namespace LagTrace
 
             if (entries.Count == 0)
             {
-                Reply(caller, "[LagTrace] No attribution data yet — wait a few seconds.");
+                CommandHelpers.Reply(caller, "[LagTrace] No attribution data yet — wait a few seconds.");
                 return;
             }
 
@@ -819,7 +820,7 @@ namespace LagTrace
                 sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
             }
 
-            Reply(caller, sb.ToString());
+            CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
@@ -840,17 +841,17 @@ namespace LagTrace
             if (list)
             {
                 var all = LagTracePlugin.Spikes.GetAll();
-                if (all.Count == 0) { Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
+                if (all.Count == 0) { CommandHelpers.Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
                 var sb = new StringBuilder();
                 sb.AppendLine("[LagTrace] Recent spikes:");
                 foreach (var s in all)
                     sb.AppendLine($"  {s.TimestampUtc:HH:mm:ss}  {s.FrameMs:F1}ms");
-                Reply(caller, sb.ToString());
+                CommandHelpers.Reply(caller, sb.ToString());
                 return;
             }
 
             var spike = LagTracePlugin.Spikes.GetLast();
-            if (spike == null) { Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
+            if (spike == null) { CommandHelpers.Reply(caller, "[LagTrace] No spikes recorded yet."); return; }
 
             var out2 = new StringBuilder();
             out2.AppendLine($"[LagTrace] Last spike at {spike.TimestampUtc:HH:mm:ss} UTC — {spike.FrameMs:F1}ms");
@@ -860,7 +861,7 @@ namespace LagTrace
                 out2.AppendLine($"  [{i,2}] {Truncate(spike.Stack[i], 70)}");
             if (spike.Stack.Length > shown)
                 out2.AppendLine($"  ... and {spike.Stack.Length - shown} more frames");
-            Reply(caller, out2.ToString());
+            CommandHelpers.Reply(caller, out2.ToString());
         }
     }
 
@@ -879,7 +880,7 @@ namespace LagTrace
             Timings.Reset();
             LagTracePlugin.Sampler.Reset();
             LagTracePlugin.PluginTracker.Reset();
-            Reply(caller, "[LagTrace] All data cleared.");
+            CommandHelpers.Reply(caller, "[LagTrace] All data cleared.");
         }
     }
 
@@ -894,9 +895,7 @@ namespace LagTrace
                 Logger.Log(message);
             else
                 Rocket.Core.Utils.TaskDispatcher.QueueOnMainThread(() =>
-                    ((SDG.Unturned.SteamPlayer)
-                        ((Rocket.Unturned.Player.UnturnedPlayer)player).SteamPlayer())
-                        ?.sendChat(message, UnityEngine.Color.cyan));
+                    Rocket.Unturned.Chat.UnturnedChat.Say(player, message, UnityEngine.Color.cyan));
         }
 
         public static string Truncate(string s, int max) =>
