@@ -322,108 +322,209 @@ namespace LagTrace
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  PluginTimingTracker — per-plugin self-time derived from the sampler.
-    //  We attribute a sample to a plugin by checking whether any frame in the
-    //  stack matches the plugin's assembly name.
+    //  PluginTimingTracker — per-source self-time derived from the sampler.
+    //
+    //  Attribution priority (leaf-first through the stack):
+    //    1. Registered plugin assembly prefix  → category Plugin
+    //    2. "SDG.Unturned.<ManagerClass>"      → category Engine, name = class
+    //    3. Everything else                    → not counted (Unity/Mono overhead)
+    //
+    //  Each registration maps an assembly-name (or namespace prefix) to a
+    //  display name + category, so both Rocket plugins and Unturned managers
+    //  appear in /lagplugins with clear labelling.
     // ─────────────────────────────────────────────────────────────────────────────
+    public enum TrackerCategory { Plugin, Engine }
+
     public class PluginTimingTracker
     {
-        // Populated by HarmonyPatcher when it finds plugin assemblies.
-        private readonly Dictionary<string, string> _assemblyToPlugin
-            = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
-        private readonly Dictionary<string, long> _hits
-            = new Dictionary<string, long>();
-        private readonly object _lock = new object();
-        private long _totalSamples;
-
-        public void RegisterPlugin(string pluginName, string assemblyName)
+        private struct Registration
         {
-            lock (_lock)
-                _assemblyToPlugin[assemblyName] = pluginName;
+            public string          DisplayName;
+            public TrackerCategory Category;
         }
 
-        // Called from SamplerEngine after each sample (optional integration).
+        // key = namespace/assembly prefix to match against frame strings
+        private readonly Dictionary<string, Registration> _registry
+            = new Dictionary<string, Registration>(StringComparer.OrdinalIgnoreCase);
+
+        private readonly Dictionary<string, long> _hits = new Dictionary<string, long>();
+        private readonly object _lock = new object();
+        private long _totalAttributed;
+
+        // ── Registration ────────────────────────────────────────────────────────
+
+        public void RegisterPlugin(string displayName, string assemblyName)
+        {
+            lock (_lock)
+                _registry[assemblyName] = new Registration
+                    { DisplayName = displayName, Category = TrackerCategory.Plugin };
+        }
+
+        /// Register a single Unturned manager type.
+        /// The prefix stored is "SDG.Unturned.ClassName" so it matches the frame
+        /// strings produced by SamplerEngine ("SDG.Unturned.VehicleManager.FixedUpdate").
+        public void RegisterEngineType(Type t)
+        {
+            var prefix = $"{t.Namespace}.{t.Name}";
+            var label  = $"[Engine] {t.Name}";
+            lock (_lock)
+                _registry[prefix] = new Registration
+                    { DisplayName = label, Category = TrackerCategory.Engine };
+        }
+
+        // ── Recording ───────────────────────────────────────────────────────────
+
         public void Record(string[] frames)
         {
-            // Walk frames and credit the first plugin we find (leaf-first = blame)
             foreach (var frame in frames)
             {
-                // Frame format: "Namespace.Type.Method"
-                // We check if the root namespace matches any registered assembly prefix.
-                foreach (var kv in _assemblyToPlugin)
+                foreach (var kv in _registry)
                 {
-                    if (frame.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
+                    if (!frame.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var displayName = kv.Value.DisplayName;
+                    lock (_lock)
                     {
-                        lock (_lock)
-                        {
-                            _hits.TryGetValue(kv.Value, out var h);
-                            _hits[kv.Value] = h + 1;
-                            _totalSamples++;
-                        }
-                        return;
+                        _hits.TryGetValue(displayName, out var h);
+                        _hits[displayName] = h + 1;
+                        _totalAttributed++;
                     }
+                    return;
                 }
             }
-            // Frame not attributable to any plugin → engine cost
-            lock (_lock) _totalSamples++;
+            // Not attributable to anything we track — Unity/Mono overhead, skip.
         }
 
-        public List<PluginTimingEntry> GetTop(int n)
+        // ── Querying ────────────────────────────────────────────────────────────
+
+        public List<PluginTimingEntry> GetTop(int n, TrackerCategory? filterCategory = null)
         {
             lock (_lock)
             {
-                if (_totalSamples == 0) return new List<PluginTimingEntry>();
+                if (_totalAttributed == 0) return new List<PluginTimingEntry>();
+
+                // Build a lookup of category per display name for filtering
+                var catMap = new Dictionary<string, TrackerCategory>(StringComparer.Ordinal);
+                foreach (var reg in _registry.Values)
+                    catMap[reg.DisplayName] = reg.Category;
+
                 return _hits
+                    .Where(kv => filterCategory == null
+                        || (catMap.TryGetValue(kv.Key, out var c) && c == filterCategory))
                     .OrderByDescending(kv => kv.Value)
                     .Take(n)
                     .Select(kv => new PluginTimingEntry
                     {
-                        PluginName   = kv.Key,
-                        Samples      = kv.Value,
-                        Pct          = kv.Value * 100.0 / _totalSamples,
+                        DisplayName = kv.Key,
+                        Samples     = kv.Value,
+                        Pct         = kv.Value * 100.0 / _totalAttributed,
+                        Category    = catMap.TryGetValue(kv.Key, out var cat)
+                                        ? cat : TrackerCategory.Plugin,
                     })
                     .ToList();
             }
         }
 
+        public long TotalAttributed { get { lock (_lock) return _totalAttributed; } }
+
         public void Reset()
         {
-            lock (_lock) { _hits.Clear(); _totalSamples = 0; }
+            lock (_lock) { _hits.Clear(); _totalAttributed = 0; }
         }
     }
 
     public class PluginTimingEntry
     {
-        public string PluginName;
-        public long   Samples;
-        public double Pct;
+        public string          DisplayName;
+        public long            Samples;
+        public double          Pct;
+        public TrackerCategory Category;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  HarmonyPatcher — patches every loaded RocketPlugin to register with the
-    //  PluginTimingTracker, and patches LateUpdate for frame-time measurement.
+    //  HarmonyPatcher — patches every loaded RocketPlugin AND the known Unturned
+    //  server-side manager types with prefix/postfix timing wrappers.
+    //
+    //  Unturned managers live in Assembly-CSharp and are not enumerable via any
+    //  Rocket API, so we maintain a curated list. These are the types that own
+    //  expensive FixedUpdate / Update loops (vehicles, animals, zombies, etc.).
+    //  The list was assembled from reading the SDG decompiled source — extend it
+    //  freely as new managers are identified.
     // ─────────────────────────────────────────────────────────────────────────────
     public static class HarmonyPatcher
     {
+        // All Unturned manager types we want to instrument.
+        // Any that don't exist in the current game version are skipped gracefully.
+        private static readonly string[] UnturnedManagerTypeNames =
+        {
+            "SDG.Unturned.VehicleManager",
+            "SDG.Unturned.AnimalManager",
+            "SDG.Unturned.ZombieManager",
+            "SDG.Unturned.BarricadeManager",
+            "SDG.Unturned.StructureManager",
+            "SDG.Unturned.ResourceManager",
+            "SDG.Unturned.ObjectManager",
+            "SDG.Unturned.ItemManager",
+            "SDG.Unturned.LightingManager",
+            "SDG.Unturned.WeatherEventListenerManager",
+            "SDG.Unturned.ClaimManager",
+            "SDG.Unturned.DamageTool",
+            "SDG.Unturned.PlayerMovement",
+            "SDG.Unturned.PlayerLife",
+            "SDG.Unturned.PlayerAnimator",
+            "SDG.Unturned.InteractableVehicle",
+            "SDG.Unturned.UseableGun",
+            "SDG.Unturned.UseableMelee",
+        };
+
+        // Methods we patch on each manager type (whichever exist)
+        private static readonly string[] TargetMethods = { "FixedUpdate", "Update", "LateUpdate" };
+
         public static void PatchLoadedPlugins(Harmony h)
         {
+            // ── Rocket plugins ───────────────────────────────────────────────────
             foreach (var plugin in Rocket.Core.R.Plugins.GetPlugins())
             {
-                var asm    = plugin.GetType().Assembly;
-                var pName  = plugin.Name;
+                if (plugin.GetType().Assembly == typeof(LagTracePlugin).Assembly)
+                    continue; // skip ourselves
+
+                var asm     = plugin.GetType().Assembly;
+                var pName   = plugin.Name;
                 var asmName = asm.GetName().Name;
 
                 LagTracePlugin.PluginTracker.RegisterPlugin(pName, asmName);
 
-                // Patch FixedUpdate if present
-                TryPatch(h, plugin.GetType(), "FixedUpdate", pName);
-                TryPatch(h, plugin.GetType(), "Update",      pName);
-                TryPatch(h, plugin.GetType(), "LateUpdate",  pName);
+                foreach (var m in TargetMethods)
+                    TryPatch(h, plugin.GetType(), m);
             }
+
+            // ── Unturned engine managers ─────────────────────────────────────────
+            // Assembly-CSharp is always loaded; resolve types directly.
+            var asmCsharp = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
+
+            if (asmCsharp == null)
+            {
+                Logger.Log("[LagTrace] Warning: Assembly-CSharp not found — engine managers won't be instrumented.");
+                return;
+            }
+
+            foreach (var typeName in UnturnedManagerTypeNames)
+            {
+                var t = asmCsharp.GetType(typeName);
+                if (t == null) continue; // version mismatch — skip silently
+
+                LagTracePlugin.PluginTracker.RegisterEngineType(t);
+
+                foreach (var m in TargetMethods)
+                    TryPatch(h, t, m);
+            }
+
+            Logger.Log("[LagTrace] Engine manager patches applied.");
         }
 
-        private static void TryPatch(Harmony h, Type t, string methodName, string pluginName)
+        private static void TryPatch(Harmony h, Type t, string methodName)
         {
             var method = t.GetMethod(methodName,
                 BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
@@ -432,7 +533,7 @@ namespace LagTrace
             try
             {
                 var prefix  = new HarmonyMethod(typeof(HarmonyPatcher)
-                    .GetMethod(nameof(TimingPrefix), BindingFlags.Static | BindingFlags.NonPublic));
+                    .GetMethod(nameof(TimingPrefix),  BindingFlags.Static | BindingFlags.NonPublic));
                 var postfix = new HarmonyMethod(typeof(HarmonyPatcher)
                     .GetMethod(nameof(TimingPostfix), BindingFlags.Static | BindingFlags.NonPublic));
 
@@ -444,7 +545,6 @@ namespace LagTrace
             }
         }
 
-        // Store Stopwatch per-call in the __state object.
         private static void TimingPrefix(ref object __state) =>
             __state = Stopwatch.StartNew();
 
@@ -617,7 +717,7 @@ namespace LagTrace
 
             foreach (var a in args)
             {
-                if (int.TryParse(a, out int parsed)) n = Math.Clamp(parsed, 1, 50);
+                if (int.TryParse(a, out int parsed)) n = Math.Max(1, Math.Min(parsed, 50));
                 if (a.Equals("avg", StringComparison.OrdinalIgnoreCase)) byAvg = true;
             }
 
@@ -647,29 +747,77 @@ namespace LagTrace
         }
     }
 
-    /// /lagplugins [n] — per-plugin breakdown
+    /// /lagplugins [n] [engine|plugins] — per-source breakdown with category grouping
     public class CommandLagPlugins : IRocketCommand
     {
         public string Name        => "lagplugins";
-        public string Help        => "Show CPU cost per plugin.";
-        public string Syntax       => "/lagplugins [n]";
+        public string Help        => "Show CPU cost per plugin and engine manager. Filter: engine / plugins.";
+        public string Syntax       => "/lagplugins [n] [engine|plugins]";
         public List<string> Aliases => new List<string> { "lp" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
         public List<string> Permissions    => new List<string> { "lagtrace.lagplugins" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
-            int n = 15;
-            if (args.Length > 0 && int.TryParse(args[0], out int parsed))
-                n = Math.Clamp(parsed, 1, 50);
+            int n = 20;
+            TrackerCategory? filter = null;
 
-            var entries = LagTracePlugin.PluginTracker.GetTop(n);
-            var sb = new StringBuilder();
-            sb.AppendLine($"[LagTrace] Plugin CPU cost (sampler attribution, top {n}):");
+            foreach (var a in args)
+            {
+                if (int.TryParse(a, out int parsed))
+                    n = Math.Max(1, Math.Min(parsed, 50));
+                else if (a.Equals("engine",  StringComparison.OrdinalIgnoreCase))
+                    filter = TrackerCategory.Engine;
+                else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase))
+                    filter = TrackerCategory.Plugin;
+            }
 
-            if (entries.Count == 0) { sb.AppendLine("  (no data yet — wait a few seconds)"); }
-            else foreach (var e in entries)
-                sb.AppendLine($"  {Truncate(e.PluginName, 40)}  {e.Pct:F1}%  ({e.Samples} samples)");
+            var tracker = LagTracePlugin.PluginTracker;
+            var entries = tracker.GetTop(n, filter);
+            var sb      = new StringBuilder();
+
+            if (entries.Count == 0)
+            {
+                Reply(caller, "[LagTrace] No attribution data yet — wait a few seconds.");
+                return;
+            }
+
+            // Header
+            string filterLabel = filter == null ? "all" :
+                                 filter == TrackerCategory.Engine ? "engine only" : "plugins only";
+            sb.AppendLine($"[LagTrace] CPU attribution ({filterLabel}, top {n}):");
+
+            // Aggregate totals for the two categories so the reader can see the
+            // big picture even when showing per-entry detail.
+            if (filter == null)
+            {
+                double enginePct = entries
+                    .Where(e => e.Category == TrackerCategory.Engine)
+                    .Sum(e => e.Pct);
+                double pluginPct = entries
+                    .Where(e => e.Category == TrackerCategory.Plugin)
+                    .Sum(e => e.Pct);
+                sb.AppendLine($"  Summary → [Engine] {enginePct:F1}%   [Plugins] {pluginPct:F1}%");
+                sb.AppendLine();
+            }
+
+            // Per-entry rows, grouped by category
+            TrackerCategory? lastCat = null;
+            foreach (var e in entries.OrderBy(e => e.Category).ThenByDescending(e => e.Pct))
+            {
+                if (e.Category != lastCat)
+                {
+                    sb.AppendLine(e.Category == TrackerCategory.Engine
+                        ? "  ── Unturned engine ──"
+                        : "  ── Rocket plugins ──");
+                    lastCat = e.Category;
+                }
+
+                // Bar: 20 chars wide, filled proportional to pct (capped at 100%)
+                int filled = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0); // 1 char = 5%
+                string bar = new string('█', filled) + new string('░', 20 - filled);
+                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
+            }
 
             Reply(caller, sb.ToString());
         }
