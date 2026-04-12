@@ -144,7 +144,7 @@ namespace LagTrace
         private volatile bool _running;
 
         // KEY: assembly name → sample count
-        private readonly ConcurrentDictionary<string, int> _counts = new();
+        private readonly ConcurrentDictionary<(string, TrackerCategory), int> _counts = new();
         private readonly Dictionary<string, TrackerCategory> _categoryRegistry = new();
 
         private int _totalSamples;
@@ -191,7 +191,10 @@ namespace LagTrace
 
                 var category = Classify(assembly);
 
-                _counts.AddOrUpdate(assembly, 1, (_, v) => v + 1);
+                // IMPORTANT: key includes category now
+                var key = (assembly, category);
+
+                _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
                 Interlocked.Increment(ref _totalSamples);
 
                 // NEW: category tracking (we add next step storage later)
@@ -205,17 +208,12 @@ namespace LagTrace
             if (total == 0) return new List<SampleEntry>();
 
             return _counts
-                .Select(kv =>
+                .Select(kv => new SampleEntry
                 {
-                    var category = IsPlugin(kv.Key) ? TrackerCategory.Plugin : TrackerCategory.Engine;
-
-                    return new SampleEntry
-                    {
-                        DisplayName = kv.Key,
-                        Samples = kv.Value,
-                        Pct = (kv.Value * 100.0) / total,
-                        Category = category
-                    };
+                    DisplayName = kv.Key.Item1,
+                    Category = kv.Key.Item2,
+                    Samples = kv.Value,
+                    Pct = (kv.Value * 100.0) / total
                 })
                 .Where(e => filter == null || e.Category == filter)
                 .OrderByDescending(e => e.Pct)
