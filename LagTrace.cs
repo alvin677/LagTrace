@@ -35,7 +35,12 @@ namespace LagTrace
             Instance = this;
 
             _harmony = new Harmony("com.lagtrace");
-            _harmony.PatchAll(Assembly.GetExecutingAssembly());
+            // _harmony.PatchAll(Assembly.GetExecutingAssembly());
+            // No attribute-based [HarmonyPatch] classes remain — PatchAll is not called.
+            // This avoids Harmony trying to patch unpatchable Unity magic methods.
+
+            // Attach frame-timing component (replaces the old MonoBehaviour LateUpdate patch).
+            gameObject.AddComponent<FrameTimingComponent>();
 
             // Patch all RocketPlugin.FixedUpdate / Update that are currently loaded
             HarmonyPatcher.PatchLoadedPlugins(_harmony);
@@ -49,16 +54,22 @@ namespace LagTrace
             };
             _samplerThread.Start();
 
-            InvokeRepeating(nameof(OnFlushWindow),
-                Configuration.Instance.WindowSeconds,
-                Configuration.Instance.WindowSeconds);
+            if (Configuration.Instance.AutoPrint)
+            {
+                InvokeRepeating(nameof(OnFlushWindow),
+                    Configuration.Instance.WindowSeconds,
+                    Configuration.Instance.WindowSeconds);
+            }
 
             Logger.Log("[LagTrace] Loaded. Commands: /lag, /lagtop, /lagplugins, /lagspike");
         }
 
         protected override void Unload()
         {
-            CancelInvoke(nameof(OnFlushWindow));
+            if (Configuration.Instance.AutoPrint)
+            {
+                CancelInvoke(nameof(OnFlushWindow));
+            }
             Sampler.Stop();
             _samplerThread?.Join(500);
             _harmony?.UnpatchAll("com.lagtrace");
@@ -79,18 +90,15 @@ namespace LagTrace
         // Called on Unity main thread by InvokeRepeating.
         private void OnFlushWindow()
         {
-            if (Configuration.Instance.AutoPrint)
-            {
-                var sb = new StringBuilder();
-                sb.AppendLine("[LagTrace] ── Top methods (last window) ──");
-                foreach (var entry in Sampler.GetTop(10))
-                    sb.AppendLine($"  {entry.Name}  {entry.SelfPct:F1}%  ({entry.TotalSamples} samples)");
-                Logger.Log(sb.ToString());
-            }
+            var sb = new StringBuilder();
+            sb.AppendLine("[LagTrace] ── Top methods (last window) ──");
+            foreach (var entry in Sampler.GetTop(10))
+                sb.AppendLine($"  {entry.Name}  {entry.SelfPct:F1}%  ({entry.TotalSamples} samples)");
+            Logger.Log(sb.ToString());
         }
 
         // ── Unity frame hook (patches applied before this) ─────────────────────
-        // Called by FrameTimingPatch every LateUpdate to feed spike detector.
+        // Called by FrameTimingComponent every LateUpdate to feed spike detector.
         public static void OnFrameComplete(float deltaMs)
         {
             Spikes.Feed(deltaMs);
@@ -561,8 +569,9 @@ namespace LagTrace
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  Timings — instrumented timing store (complementary to sampler)
-    //  Used both by Harmony patches and by the public `Timings.Start()` API.
+    //  FrameTimingComponent — attached to the plugin GameObject at load time.
+    //  Unity calls LateUpdate() on it every frame, giving us real frame-time
+    //  without needing to patch MonoBehaviour (which has no patchable LateUpdate).
     // ─────────────────────────────────────────────────────────────────────────────
     public static class Timings
     {
