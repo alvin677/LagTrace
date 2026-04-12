@@ -35,7 +35,6 @@ namespace LagTrace
             Instance = this;
 
             _harmony = new Harmony("com.lagtrace");
-            // _harmony.PatchAll(Assembly.GetExecutingAssembly());
             // No attribute-based [HarmonyPatch] classes remain — PatchAll is not called.
             // This avoids Harmony trying to patch unpatchable Unity magic methods.
 
@@ -48,18 +47,16 @@ namespace LagTrace
             // Start background sampler (samples main thread stack every N ms)
             _samplerThread = new Thread(SamplerLoop)
             {
-                Name       = "LagTrace-Sampler",
+                Name = "LagTrace-Sampler",
                 IsBackground = true,
-                Priority   = System.Threading.ThreadPriority.BelowNormal
+                Priority = System.Threading.ThreadPriority.BelowNormal
             };
             _samplerThread.Start();
 
             if (Configuration.Instance.AutoPrint)
-            {
-                InvokeRepeating(nameof(OnFlushWindow),
+                InvokeRepeating(nameof(OnFlushWindow), 
                     Configuration.Instance.WindowSeconds,
                     Configuration.Instance.WindowSeconds);
-            }
 
             Logger.Log("[LagTrace] Loaded. Commands: /lag, /lagtop, /lagplugins, /lagspike");
         }
@@ -67,9 +64,7 @@ namespace LagTrace
         protected override void Unload()
         {
             if (Configuration.Instance.AutoPrint)
-            {
                 CancelInvoke(nameof(OnFlushWindow));
-            }
             Sampler.Stop();
             _samplerThread?.Join(500);
             _harmony?.UnpatchAll("com.lagtrace");
@@ -110,19 +105,19 @@ namespace LagTrace
     // ─────────────────────────────────────────────────────────────────────────────
     public class LagTraceConfig : Rocket.API.IRocketPluginConfiguration
     {
-        public int    SampleIntervalMs = 5;     // How often the sampler snapshots
-        public int    WindowSeconds    = 60;    // Flush/report window
-        public float  SpikeThresholdMs = 50f;  // A frame longer than this is a "spike"
-        public bool   AutoPrint        = false; // Print top to console each window
-        public int    TopN             = 10;    // Default rows for /lagtop
+        public int SampleIntervalMs = 5;     // How often the sampler snapshots
+        public int WindowSeconds = 60;    // Flush/report window
+        public float SpikeThresholdMs = 50f;  // A frame longer than this is a "spike"
+        public bool AutoPrint = false; // Print top to console each window
+        public int TopN = 10;    // Default rows for /lagtop
 
         public void LoadDefaults()
         {
             SampleIntervalMs = 5;
-            WindowSeconds    = 60;
+            WindowSeconds = 60;
             SpikeThresholdMs = 50f;
-            AutoPrint        = false;
-            TopN             = 10;
+            AutoPrint = false;
+            TopN = 10;
         }
     }
 
@@ -143,7 +138,7 @@ namespace LagTrace
         private const int MaxDepth = 40;
 
         private volatile bool _running = true;
-        public  bool Running => _running;
+        public bool Running => _running;
 
         // Key = fully-qualified method name, value = (self, total) sample counts
         private readonly Dictionary<string, (long self, long total)> _counts
@@ -177,7 +172,7 @@ namespace LagTrace
                 return; // Thread may have ended between Suspend and StackTrace
             }
 
-            int depth  = Math.Min(st.FrameCount, MaxDepth);
+            int depth = Math.Min(st.FrameCount, MaxDepth);
             var frames = new string[depth];
 
             for (int i = 0; i < depth; i++)
@@ -210,7 +205,7 @@ namespace LagTrace
         {
             bool taken = false;
             _lock.Enter(ref taken);
-            try   { return (string[])_lastStack.Clone(); }
+            try { return (string[])_lastStack.Clone(); }
             finally { if (taken) _lock.Exit(); }
         }
 
@@ -219,7 +214,7 @@ namespace LagTrace
             bool taken = false;
             _lock.Enter(ref taken);
             Dictionary<string, (long self, long total)> snap;
-            try   { snap = new Dictionary<string, (long, long)>(_counts); }
+            try { snap = new Dictionary<string, (long, long)>(_counts); }
             finally { if (taken) _lock.Exit(); }
 
             long grandTotal = snap.Values.Sum(v => v.self);
@@ -230,10 +225,10 @@ namespace LagTrace
                 .Take(n)
                 .Select(kv => new SamplerEntry
                 {
-                    Name         = kv.Key,
+                    Name = kv.Key,
                     TotalSamples = kv.Value.self,
-                    SelfPct      = kv.Value.self * 100.0 / grandTotal,
-                    TotalPct     = kv.Value.total * 100.0 / grandTotal,
+                    SelfPct = kv.Value.self * 100.0 / grandTotal,
+                    TotalPct = kv.Value.total * 100.0 / grandTotal,
                 })
                 .ToList();
         }
@@ -242,7 +237,7 @@ namespace LagTrace
         {
             bool taken = false;
             _lock.Enter(ref taken);
-            try   { _counts.Clear(); }
+            try { _counts.Clear(); }
             finally { if (taken) _lock.Exit(); }
         }
     }
@@ -250,7 +245,7 @@ namespace LagTrace
     public class SamplerEntry
     {
         public string Name;
-        public long   TotalSamples;
+        public long TotalSamples;
         public double SelfPct;
         public double TotalPct;
     }
@@ -276,8 +271,8 @@ namespace LagTrace
         // Ring buffer of recent spikes
         private const int MaxSpikes = 20;
         private readonly SpikeRecord[] _ring = new SpikeRecord[MaxSpikes];
-        private int  _head  = 0;
-        private int  _count = 0;
+        private int _head = 0;
+        private int _count = 0;
         private readonly object _lock = new object();
 
         public void Feed(float frameMs)
@@ -289,8 +284,8 @@ namespace LagTrace
             var record = new SpikeRecord
             {
                 TimestampUtc = DateTime.UtcNow,
-                FrameMs      = frameMs,
-                Stack        = stack,
+                FrameMs = frameMs,
+                Stack = stack,
             };
 
             lock (_lock)
@@ -326,7 +321,7 @@ namespace LagTrace
     public class SpikeRecord
     {
         public DateTime TimestampUtc;
-        public float    FrameMs;
+        public float FrameMs;
         public string[] Stack;
     }
 
@@ -348,7 +343,7 @@ namespace LagTrace
     {
         private struct Registration
         {
-            public string          DisplayName;
+            public string DisplayName;
             public TrackerCategory Category;
         }
 
@@ -366,7 +361,7 @@ namespace LagTrace
         {
             lock (_lock)
                 _registry[assemblyName] = new Registration
-                    { DisplayName = displayName, Category = TrackerCategory.Plugin };
+                { DisplayName = displayName, Category = TrackerCategory.Plugin };
         }
 
         /// Register a single Unturned manager type.
@@ -375,10 +370,10 @@ namespace LagTrace
         public void RegisterEngineType(Type t)
         {
             var prefix = $"{t.Namespace}.{t.Name}";
-            var label  = $"[Engine] {t.Name}";
+            var label = $"[Engine] {t.Name}";
             lock (_lock)
                 _registry[prefix] = new Registration
-                    { DisplayName = label, Category = TrackerCategory.Engine };
+                { DisplayName = label, Category = TrackerCategory.Engine };
         }
 
         // ── Recording ───────────────────────────────────────────────────────────
@@ -426,9 +421,9 @@ namespace LagTrace
                     .Select(kv => new PluginTimingEntry
                     {
                         DisplayName = kv.Key,
-                        Samples     = kv.Value,
-                        Pct         = kv.Value * 100.0 / _totalAttributed,
-                        Category    = catMap.TryGetValue(kv.Key, out var cat)
+                        Samples = kv.Value,
+                        Pct = kv.Value * 100.0 / _totalAttributed,
+                        Category = catMap.TryGetValue(kv.Key, out var cat)
                                         ? cat : TrackerCategory.Plugin,
                     })
                     .ToList();
@@ -445,9 +440,9 @@ namespace LagTrace
 
     public class PluginTimingEntry
     {
-        public string          DisplayName;
-        public long            Samples;
-        public double          Pct;
+        public string DisplayName;
+        public long Samples;
+        public double Pct;
         public TrackerCategory Category;
     }
 
@@ -498,8 +493,8 @@ namespace LagTrace
                 if (plugin.GetType().Assembly == typeof(LagTracePlugin).Assembly)
                     continue; // skip ourselves
 
-                var asm     = plugin.GetType().Assembly;
-                var pName   = plugin.Name;
+                var asm = plugin.GetType().Assembly;
+                var pName = plugin.Name;
                 var asmName = asm.GetName().Name;
 
                 LagTracePlugin.PluginTracker.RegisterPlugin(pName, asmName);
@@ -541,8 +536,8 @@ namespace LagTrace
 
             try
             {
-                var prefix  = new HarmonyMethod(typeof(HarmonyPatcher)
-                    .GetMethod(nameof(TimingPrefix),  BindingFlags.Static | BindingFlags.NonPublic));
+                var prefix = new HarmonyMethod(typeof(HarmonyPatcher)
+                    .GetMethod(nameof(TimingPrefix), BindingFlags.Static | BindingFlags.NonPublic));
                 var postfix = new HarmonyMethod(typeof(HarmonyPatcher)
                     .GetMethod(nameof(TimingPostfix), BindingFlags.Static | BindingFlags.NonPublic));
 
@@ -569,9 +564,8 @@ namespace LagTrace
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  FrameTimingComponent — attached to the plugin GameObject at load time.
-    //  Unity calls LateUpdate() on it every frame, giving us real frame-time
-    //  without needing to patch MonoBehaviour (which has no patchable LateUpdate).
+    //  Timings — instrumented timing store (complementary to sampler)
+    //  Used both by Harmony patches and by the public `Timings.Start()` API.
     // ─────────────────────────────────────────────────────────────────────────────
     public static class Timings
     {
@@ -605,15 +599,15 @@ namespace LagTrace
                     .Select(kv =>
                     {
                         double totalMs = kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency;
-                        double avgMs   = kv.Value.Calls > 0 ? totalMs / kv.Value.Calls : 0;
-                        double maxMs   = kv.Value.MaxTicks  * 1000.0 / Stopwatch.Frequency;
+                        double avgMs = kv.Value.Calls > 0 ? totalMs / kv.Value.Calls : 0;
+                        double maxMs = kv.Value.MaxTicks * 1000.0 / Stopwatch.Frequency;
                         return new TimingEntry
                         {
-                            Name    = kv.Key,
+                            Name = kv.Key,
                             TotalMs = totalMs,
-                            AvgMs   = avgMs,
-                            MaxMs   = maxMs,
-                            Calls   = kv.Value.Calls,
+                            AvgMs = avgMs,
+                            MaxMs = maxMs,
+                            Calls = kv.Value.Calls,
                         };
                     })
                     .OrderByDescending(e => perCall ? e.AvgMs : e.TotalMs)
@@ -634,12 +628,12 @@ namespace LagTrace
         {
             public long TotalTicks;
             public long MaxTicks;
-            public int  Calls;
+            public int Calls;
         }
 
         private class TimerScope : IDisposable
         {
-            private readonly string    _name;
+            private readonly string _name;
             private readonly Stopwatch _sw;
 
             public TimerScope(string name) { _name = name; _sw = Stopwatch.StartNew(); }
@@ -658,25 +652,26 @@ namespace LagTrace
         public double TotalMs;
         public double AvgMs;
         public double MaxMs;
-        public int    Calls;
+        public int Calls;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
-    //  Harmony patches
+    //  FrameTimingComponent — attached to the plugin GameObject at load time.
+    //  Unity calls LateUpdate() on it every frame, giving us real frame-time
+    //  without needing to patch MonoBehaviour (which has no patchable LateUpdate).
     // ─────────────────────────────────────────────────────────────────────────────
-
-    // Measure each LateUpdate so we can report frame-time to the spike detector.
-    [HarmonyPatch(typeof(MonoBehaviour), "LateUpdate")]
-    public class FrameTimingPatch
+    public class FrameTimingComponent : MonoBehaviour
     {
-        private static float _lastTime;
+        private float _lastTime;
 
-        static void Prefix() => _lastTime = Time.realtimeSinceStartup;
-
-        static void Postfix()
+        private void LateUpdate()
         {
-            float delta = (Time.realtimeSinceStartup - _lastTime) * 1000f;
-            LagTracePlugin.OnFrameComplete(delta);
+            float now = Time.realtimeSinceStartup;
+            float delta = (now - _lastTime) * 1000f;
+            _lastTime = now;
+
+            if (delta > 0f)
+                LagTracePlugin.OnFrameComplete(delta);
         }
     }
 
@@ -687,12 +682,12 @@ namespace LagTrace
     /// /lag — quick server health snapshot
     public class CommandLag : IRocketCommand
     {
-        public string Name        => "lag";
-        public string Help        => "Show current TPS and top methods.";
-        public string Syntax       => "/lag";
+        public string Name => "lag";
+        public string Help => "Show current TPS and top methods.";
+        public string Syntax => "/lag";
         public List<string> Aliases => new List<string>();
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions    => new List<string> { "lagtrace.lag" };
+        public List<string> Permissions => new List<string> { "lagtrace.lag" };
 
         public void Execute(IRocketPlayer caller, string[] command)
         {
@@ -704,7 +699,7 @@ namespace LagTrace
             sb.AppendLine("Top 5 methods (self%):");
             if (top.Count == 0) { sb.AppendLine("  (no data yet — wait a few seconds)"); }
             else foreach (var e in top)
-                sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
+                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
 
             CommandHelpers.Reply(caller, sb.ToString());
         }
@@ -713,17 +708,17 @@ namespace LagTrace
     /// /lagtop [n] [avg] — top methods, optionally sorted by avg time
     public class CommandLagTop : IRocketCommand
     {
-        public string Name        => "lagtop";
-        public string Help        => "Show top N heaviest methods. Usage: /lagtop [n] [avg]";
-        public string Syntax       => "/lagtop [n] [avg]";
+        public string Name => "lagtop";
+        public string Help => "Show top N heaviest methods. Usage: /lagtop [n] [avg]";
+        public string Syntax => "/lagtop [n] [avg]";
         public List<string> Aliases => new List<string> { "lt" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions    => new List<string> { "lagtrace.lagtop" };
+        public List<string> Permissions => new List<string> { "lagtrace.lagtop" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
-            int  n      = LagTracePlugin.Instance.Configuration.Instance.TopN;
-            bool byAvg  = false;
+            int n = LagTracePlugin.Instance.Configuration.Instance.TopN;
+            bool byAvg = false;
 
             foreach (var a in args)
             {
@@ -732,7 +727,7 @@ namespace LagTrace
             }
 
             // Prefer instrumented data; fall back to sampler for methods without explicit timing.
-            var timed   = Timings.GetTop(n, byAvg);
+            var timed = Timings.GetTop(n, byAvg);
             var sampled = LagTracePlugin.Sampler.GetTop(n);
 
             var sb = new StringBuilder();
@@ -760,12 +755,12 @@ namespace LagTrace
     /// /lagplugins [n] [engine|plugins] — per-source breakdown with category grouping
     public class CommandLagPlugins : IRocketCommand
     {
-        public string Name        => "lagplugins";
-        public string Help        => "Show CPU cost per plugin and engine manager. Filter: engine / plugins.";
-        public string Syntax       => "/lagplugins [n] [engine|plugins]";
+        public string Name => "lagplugins";
+        public string Help => "Show CPU cost per plugin and engine manager. Filter: engine / plugins.";
+        public string Syntax => "/lagplugins [n] [engine|plugins]";
         public List<string> Aliases => new List<string> { "lp" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions    => new List<string> { "lagtrace.lagplugins" };
+        public List<string> Permissions => new List<string> { "lagtrace.lagplugins" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
@@ -776,7 +771,7 @@ namespace LagTrace
             {
                 if (int.TryParse(a, out int parsed))
                     n = Math.Max(1, Math.Min(parsed, 50));
-                else if (a.Equals("engine",  StringComparison.OrdinalIgnoreCase))
+                else if (a.Equals("engine", StringComparison.OrdinalIgnoreCase))
                     filter = TrackerCategory.Engine;
                 else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase))
                     filter = TrackerCategory.Plugin;
@@ -784,7 +779,7 @@ namespace LagTrace
 
             var tracker = LagTracePlugin.PluginTracker;
             var entries = tracker.GetTop(n, filter);
-            var sb      = new StringBuilder();
+            var sb = new StringBuilder();
 
             if (entries.Count == 0)
             {
@@ -836,12 +831,12 @@ namespace LagTrace
     /// /lagspike — show last recorded lag spike
     public class CommandLagSpike : IRocketCommand
     {
-        public string Name        => "lagspike";
-        public string Help        => "Show the most recent lag spike call stack.";
-        public string Syntax       => "/lagspike [list]";
+        public string Name => "lagspike";
+        public string Help => "Show the most recent lag spike call stack.";
+        public string Syntax => "/lagspike [list]";
         public List<string> Aliases => new List<string> { "ls" };
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions    => new List<string> { "lagtrace.lagspike" };
+        public List<string> Permissions => new List<string> { "lagtrace.lagspike" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
@@ -877,12 +872,12 @@ namespace LagTrace
     /// /lagreset — clear all accumulated data
     public class CommandLagReset : IRocketCommand
     {
-        public string Name        => "lagreset";
-        public string Help        => "Reset all LagTrace timing data.";
-        public string Syntax       => "/lagreset";
+        public string Name => "lagreset";
+        public string Help => "Reset all LagTrace timing data.";
+        public string Syntax => "/lagreset";
         public List<string> Aliases => new List<string>();
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
-        public List<string> Permissions    => new List<string> { "lagtrace.reset" };
+        public List<string> Permissions => new List<string> { "lagtrace.reset" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
@@ -915,6 +910,6 @@ namespace LagTrace
     public abstract class CommandBase
     {
         protected static void Reply(IRocketPlayer p, string msg) => CommandHelpers.Reply(p, msg);
-        protected static string Truncate(string s, int n)        => CommandHelpers.Truncate(s, n);
+        protected static string Truncate(string s, int n) => CommandHelpers.Truncate(s, n);
     }
 }
