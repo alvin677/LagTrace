@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -11,6 +12,7 @@ using Rocket.Core.Logging;
 using Rocket.Core.Plugins;
 using UnityEngine;
 using Logger = Rocket.Core.Logging.Logger;
+using ThreadPriority = System.Threading.ThreadPriority;
 
 namespace LagTrace
 {
@@ -25,9 +27,8 @@ namespace LagTrace
         private Thread _samplerThread;
 
         // Exposed so commands can read without locking.
-        public static readonly SamplerEngine Sampler = new SamplerEngine();
+        public static readonly Sampler Sampler = new Sampler();
         public static readonly SpikeDetector Spikes = new SpikeDetector();
-        public static readonly PluginTimingTracker PluginTracker = new PluginTimingTracker();
 
         protected override void Load()
         {
@@ -48,6 +49,7 @@ namespace LagTrace
             HarmonyPatcher.PatchLoadedPlugins(_harmony);
 
             // Start background sampler (samples main thread stack every N ms)
+            Sampler.Start();
             _samplerThread = new Thread(SamplerLoop)
             {
                 Name = "LagTrace-Sampler",
@@ -91,7 +93,7 @@ namespace LagTrace
             var sb = new StringBuilder();
             sb.AppendLine("[LagTrace] ── Top methods (last window) ──");
             foreach (var entry in Sampler.GetTop(10))
-                sb.AppendLine($"  {entry.Name}  {entry.SelfPct:F1}%  ({entry.TotalSamples} samples)");
+                sb.AppendLine($"  {entry.DisplayName}  {entry.Pct:F1}%  ({entry.Samples} samples)");
             Logger.Log(sb.ToString());
         }
 
@@ -136,121 +138,90 @@ namespace LagTrace
     //  allocations. Thread safety: Interlocked on the running flag; Dictionary
     //  access is behind a lightweight SpinLock since samples are very frequent.
     // ─────────────────────────────────────────────────────────────────────────────
-    public class SamplerEngine
+    public class Sampler
     {
-        private const int MaxDepth = 40;
+        private volatile bool _running;
 
-        private volatile bool _running = true;
+        // KEY: assembly name → sample count
+        private readonly ConcurrentDictionary<string, int> _counts = new();
+
+        private int _totalSamples;
+
+        public void Start()
+        {
+            _running = true;
+        }
+
+        public void Stop()
+        {
+            _running = false;
+        }
+
         public bool Running => _running;
-
-        // Key = fully-qualified method name, value = (self, total) sample counts
-        private readonly Dictionary<string, (long self, long total)> _counts
-            = new Dictionary<string, (long, long)>(512);
-        private SpinLock _lock = new SpinLock(false);
-
-        // For spike recording we also store the last raw stack
-        private string[] _lastStack = Array.Empty<string>();
-
-        public void Stop() => _running = false;
 
         public void Sample()
         {
-            // Capture stack on the main Unity thread via Thread.CurrentThread is NOT
-            // the sampler thread. We need a reference to the main thread stored at
-            // startup. This is done via MainThreadRef below.
-            var mainThread = MainThreadRef.Thread;
-            if (mainThread == null || !_running) return;
+            var mainThread = MainThreadRef.MainThread;
+            if (mainThread == null) return;
 
-            StackTrace st;
-            try
-            {
-#pragma warning disable CS0618 // Suspend/Resume are deprecated but still functional on .NET 4.x
-                mainThread.Suspend();
-                st = new StackTrace(mainThread, false);
-                mainThread.Resume();
-#pragma warning restore CS0618
-            }
-            catch
-            {
-                return; // Thread may have ended between Suspend and StackTrace
-            }
+            var stackTrace = new StackTrace(mainThread, false);
+            if (stackTrace.FrameCount == 0) return;
 
-            int depth = Math.Min(st.FrameCount, MaxDepth);
-            var frames = new string[depth];
+            var frame = stackTrace.GetFrame(0);
+            var method = frame?.GetMethod();
+            if (method == null) return;
 
-            for (int i = 0; i < depth; i++)
-            {
-                var m = st.GetFrame(i)?.GetMethod();
-                frames[i] = m != null
-                    ? $"{m.DeclaringType?.FullName ?? "?"}.{m.Name}"
-                    : "?";
-            }
+            string key = method.DeclaringType?.Assembly?.GetName()?.Name ?? "unknown";
 
-            bool taken = false;
-            _lock.Enter(ref taken);
-            try
-            {
-                for (int i = 0; i < frames.Length; i++)
-                {
-                    var name = frames[i];
-                    _counts.TryGetValue(name, out var c);
-                    _counts[name] = (i == 0 ? c.self + 1 : c.self, c.total + 1);
-                }
-                _lastStack = frames;
-            }
-            finally
-            {
-                if (taken) _lock.Exit();
-            }
+            _counts.AddOrUpdate(key, 1, (_, v) => v + 1);
+            Interlocked.Increment(ref _totalSamples);
         }
 
-        public string[] GetLastStack()
+        public List<SampleEntry> GetTop(int n, TrackerCategory? filter = null)
         {
-            bool taken = false;
-            _lock.Enter(ref taken);
-            try { return (string[])_lastStack.Clone(); }
-            finally { if (taken) _lock.Exit(); }
-        }
+            int total = _totalSamples;
+            if (total == 0) return new List<SampleEntry>();
 
-        public List<SamplerEntry> GetTop(int n)
-        {
-            bool taken = false;
-            _lock.Enter(ref taken);
-            Dictionary<string, (long self, long total)> snap;
-            try { snap = new Dictionary<string, (long, long)>(_counts); }
-            finally { if (taken) _lock.Exit(); }
-
-            long grandTotal = snap.Values.Sum(v => v.self);
-            if (grandTotal == 0) return new List<SamplerEntry>();
-
-            return snap
-                .OrderByDescending(kv => kv.Value.self)
-                .Take(n)
-                .Select(kv => new SamplerEntry
+            return _counts
+                .Select(kv =>
                 {
-                    Name = kv.Key,
-                    TotalSamples = kv.Value.self,
-                    SelfPct = kv.Value.self * 100.0 / grandTotal,
-                    TotalPct = kv.Value.total * 100.0 / grandTotal,
+                    var category = IsPlugin(kv.Key) ? TrackerCategory.Plugin : TrackerCategory.Engine;
+
+                    return new SampleEntry
+                    {
+                        DisplayName = kv.Key,
+                        Samples = kv.Value,
+                        Pct = (kv.Value * 100.0) / total,
+                        Category = category
+                    };
                 })
+                .Where(e => filter == null || e.Category == filter)
+                .OrderByDescending(e => e.Pct)
+                .Take(n)
                 .ToList();
+        }
+
+        private bool IsPlugin(string assemblyName)
+        {
+            return assemblyName != null &&
+                   !assemblyName.StartsWith("Unity") &&
+                   !assemblyName.StartsWith("System") &&
+                   !assemblyName.StartsWith("mscorlib") &&
+                   assemblyName != "Assembly-CSharp";
         }
 
         public void Reset()
         {
-            bool taken = false;
-            _lock.Enter(ref taken);
-            try { _counts.Clear(); }
-            finally { if (taken) _lock.Exit(); }
+            _counts.Clear();
+            _totalSamples = 0;
         }
     }
-
-    public class SamplerEntry
+    public class SampleEntry
     {
-        public string Name;
-        public long TotalSamples;
-        public double SelfPct;
-        public double TotalPct;
+        public string DisplayName;
+        public int Samples;
+        public double Pct;
+        public TrackerCategory Category;
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -262,10 +233,11 @@ namespace LagTrace
     // ─────────────────────────────────────────────────────────────────────────────
     public static class MainThreadRef
     {
-        public static Thread Thread { get; private set; }
-
-        /// Call from any method guaranteed to run on the main thread.
-        public static void Capture() => Thread = System.Threading.Thread.CurrentThread;
+        public static Thread MainThread;
+        public static void Capture()
+        {
+            MainThread = Thread.CurrentThread;
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
@@ -286,12 +258,11 @@ namespace LagTrace
             if (frameMs < LagTracePlugin.Instance.Configuration.Instance.SpikeThresholdMs)
                 return;
 
-            var stack = LagTracePlugin.Sampler.GetLastStack();
             var record = new SpikeRecord
             {
                 TimestampUtc = DateTime.UtcNow,
                 FrameMs = frameMs,
-                Stack = stack,
+                Stack = Array.Empty<string>(),
             };
 
             lock (_lock)
@@ -345,113 +316,6 @@ namespace LagTrace
     // ─────────────────────────────────────────────────────────────────────────────
     public enum TrackerCategory { Plugin, Engine }
 
-    public class PluginTimingTracker
-    {
-        private struct Registration
-        {
-            public string DisplayName;
-            public TrackerCategory Category;
-        }
-
-        // key = namespace/assembly prefix to match against frame strings
-        private readonly Dictionary<string, Registration> _registry
-            = new Dictionary<string, Registration>(StringComparer.OrdinalIgnoreCase);
-
-        private readonly Dictionary<string, long> _hits = new Dictionary<string, long>();
-        private readonly object _lock = new object();
-        private long _totalAttributed;
-
-        // ── Registration ────────────────────────────────────────────────────────
-
-        public void RegisterPlugin(string displayName, string assemblyName)
-        {
-            lock (_lock)
-                _registry[assemblyName] = new Registration
-                { DisplayName = displayName, Category = TrackerCategory.Plugin };
-        }
-
-        /// Register a single Unturned manager type.
-        /// The prefix stored is "SDG.Unturned.ClassName" so it matches the frame
-        /// strings produced by SamplerEngine ("SDG.Unturned.VehicleManager.FixedUpdate").
-        public void RegisterEngineType(Type t)
-        {
-            var prefix = $"{t.Namespace}.{t.Name}";
-            var label = $"[Engine] {t.Name}";
-            lock (_lock)
-                _registry[prefix] = new Registration
-                { DisplayName = label, Category = TrackerCategory.Engine };
-        }
-
-        // ── Recording ───────────────────────────────────────────────────────────
-
-        public void Record(string[] frames)
-        {
-            foreach (var frame in frames)
-            {
-                foreach (var kv in _registry)
-                {
-                    if (!frame.StartsWith(kv.Key, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    var displayName = kv.Value.DisplayName;
-                    lock (_lock)
-                    {
-                        _hits.TryGetValue(displayName, out var h);
-                        _hits[displayName] = h + 1;
-                        _totalAttributed++;
-                    }
-                    return;
-                }
-            }
-            // Not attributable to anything we track — Unity/Mono overhead, skip.
-        }
-
-        // ── Querying ────────────────────────────────────────────────────────────
-
-        public List<PluginTimingEntry> GetTop(int n, TrackerCategory? filterCategory = null)
-        {
-            lock (_lock)
-            {
-                if (_totalAttributed == 0) return new List<PluginTimingEntry>();
-
-                // Build a lookup of category per display name for filtering
-                var catMap = new Dictionary<string, TrackerCategory>(StringComparer.Ordinal);
-                foreach (var reg in _registry.Values)
-                    catMap[reg.DisplayName] = reg.Category;
-
-                return _hits
-                    .Where(kv => filterCategory == null
-                        || (catMap.TryGetValue(kv.Key, out var c) && c == filterCategory))
-                    .OrderByDescending(kv => kv.Value)
-                    .Take(n)
-                    .Select(kv => new PluginTimingEntry
-                    {
-                        DisplayName = kv.Key,
-                        Samples = kv.Value,
-                        Pct = kv.Value * 100.0 / _totalAttributed,
-                        Category = catMap.TryGetValue(kv.Key, out var cat)
-                                        ? cat : TrackerCategory.Plugin,
-                    })
-                    .ToList();
-            }
-        }
-
-        public long TotalAttributed { get { lock (_lock) return _totalAttributed; } }
-
-        public void Reset()
-        {
-            lock (_lock) { _hits.Clear(); _totalAttributed = 0; }
-        }
-    }
-
-    public class PluginTimingEntry
-    {
-        public string DisplayName;
-        public long Samples;
-        public double Pct;
-        public TrackerCategory Category;
-    }
-
     // ─────────────────────────────────────────────────────────────────────────────
     //  HarmonyPatcher — patches every loaded RocketPlugin AND the known Unturned
     //  server-side manager types with prefix/postfix timing wrappers.
@@ -503,8 +367,6 @@ namespace LagTrace
                 var pName = plugin.Name;
                 var asmName = asm.GetName().Name;
 
-                LagTracePlugin.PluginTracker.RegisterPlugin(pName, asmName);
-
                 foreach (var m in TargetMethods)
                     TryPatch(h, plugin.GetType(), m);
             }
@@ -524,8 +386,6 @@ namespace LagTrace
             {
                 var t = asmCsharp.GetType(typeName);
                 if (t == null) continue; // version mismatch — skip silently
-
-                LagTracePlugin.PluginTracker.RegisterEngineType(t);
 
                 foreach (var m in TargetMethods)
                     TryPatch(h, t, m);
@@ -685,13 +545,6 @@ namespace LagTrace
 
             if (delta > 0f)
                 LagTracePlugin.OnFrameComplete(delta);
-
-            // Feed plugin attribution from the sampler's last captured stack.
-            // Doing this here (main thread, every frame) is simpler and safer than
-            // calling Record() from inside the sampler thread.
-            var lastStack = LagTracePlugin.Sampler.GetLastStack();
-            if (lastStack.Length > 0)
-                LagTracePlugin.PluginTracker.Record(lastStack);
         }
     }
 
@@ -719,7 +572,7 @@ namespace LagTrace
             sb.AppendLine("Top 5 methods (self%):");
             if (top.Count == 0) { sb.AppendLine("  (no data yet — wait a few seconds)"); }
             else foreach (var e in top)
-                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 55)}  {e.SelfPct:F1}%");
+                    sb.AppendLine($"  {CommandHelpers.Truncate(e.DisplayName, 55)}  {e.Pct:F1}%");
 
             CommandHelpers.Reply(caller, sb.ToString());
         }
@@ -763,7 +616,7 @@ namespace LagTrace
             {
                 sb.AppendLine("  ── Sampler (all code) ──");
                 foreach (var e in sampled)
-                    sb.AppendLine($"  {CommandHelpers.Truncate(e.Name, 52)}  {e.SelfPct:F1}%");
+                    sb.AppendLine($"  {CommandHelpers.Truncate(e.DisplayName, 52)}  {e.Pct:F1}%");
             }
             if (timed.Count == 0 && sampled.Count == 0)
                 sb.AppendLine("  (no data yet)");
@@ -797,9 +650,7 @@ namespace LagTrace
                     filter = TrackerCategory.Plugin;
             }
 
-            var tracker = LagTracePlugin.PluginTracker;
-            var entries = tracker.GetTop(n, filter);
-            var sb = new StringBuilder();
+            var entries = LagTracePlugin.Sampler.GetTop(n, filter);
 
             if (entries.Count == 0)
             {
@@ -807,27 +658,24 @@ namespace LagTrace
                 return;
             }
 
-            // Header
+            var sb = new StringBuilder();
+
             string filterLabel = filter == null ? "all" :
                                  filter == TrackerCategory.Engine ? "engine only" : "plugins only";
+
             sb.AppendLine($"[LagTrace] CPU attribution ({filterLabel}, top {n}):");
 
-            // Aggregate totals for the two categories so the reader can see the
-            // big picture even when showing per-entry detail.
             if (filter == null)
             {
-                double enginePct = entries
-                    .Where(e => e.Category == TrackerCategory.Engine)
-                    .Sum(e => e.Pct);
-                double pluginPct = entries
-                    .Where(e => e.Category == TrackerCategory.Plugin)
-                    .Sum(e => e.Pct);
+                double enginePct = entries.Where(e => e.Category == TrackerCategory.Engine).Sum(e => e.Pct);
+                double pluginPct = entries.Where(e => e.Category == TrackerCategory.Plugin).Sum(e => e.Pct);
+
                 sb.AppendLine($"  Summary → [Engine] {enginePct:F1}%   [Plugins] {pluginPct:F1}%");
                 sb.AppendLine();
             }
 
-            // Per-entry rows, grouped by category
             TrackerCategory? lastCat = null;
+
             foreach (var e in entries.OrderBy(e => e.Category).ThenByDescending(e => e.Pct))
             {
                 if (e.Category != lastCat)
@@ -838,9 +686,9 @@ namespace LagTrace
                     lastCat = e.Category;
                 }
 
-                // Bar: 20 chars wide, filled proportional to pct (capped at 100%)
-                int filled = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0); // 1 char = 5%
+                int filled = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0);
                 string bar = new string('█', filled) + new string('░', 20 - filled);
+
                 sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {CommandHelpers.Truncate(e.DisplayName, 38)}  ({e.Samples} samples)");
             }
 
@@ -901,9 +749,7 @@ namespace LagTrace
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
-            Timings.Reset();
             LagTracePlugin.Sampler.Reset();
-            LagTracePlugin.PluginTracker.Reset();
             CommandHelpers.Reply(caller, "[LagTrace] All data cleared.");
         }
     }
