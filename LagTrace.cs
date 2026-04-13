@@ -197,6 +197,8 @@ namespace LagTrace
     // ─────────────────────────────────────────────────────────────────────────────
     public static class HarmonyPatcher
     {
+        // Curated Unturned engine types — these are the manager singletons that own
+        // the main game loops. We patch their Update/FixedUpdate/LateUpdate exactly.
         private static readonly string[] UnturnedManagerTypeNames =
         {
             "SDG.Unturned.VehicleManager",
@@ -219,11 +221,11 @@ namespace LagTrace
             "SDG.Unturned.UseableMelee",
         };
 
-        private static readonly string[] TargetMethods = { "FixedUpdate", "Update", "LateUpdate" };
+        private static readonly string[] UnityLoopMethods = { "FixedUpdate", "Update", "LateUpdate" };
 
         // Maps "TypeName.MethodName" → (display label, category) for /lagplugins aggregation.
         private static readonly Dictionary<string, (string label, TrackerCategory cat)> _labels
-            = new Dictionary<string, (string, TrackerCategory)>(256);
+            = new Dictionary<string, (string, TrackerCategory)>(512);
 
         public static bool TryGetLabel(string key, out string label, out TrackerCategory cat)
         {
@@ -233,50 +235,145 @@ namespace LagTrace
 
         public static void PatchAll(Harmony h)
         {
-            // Rocket plugins
+            int pluginMethods  = 0;
+            int engineMethods  = 0;
+
+            // ── 1. All methods in every plugin assembly ───────────────────────────
+            // We scan the whole assembly rather than just the plugin's root type so
+            // that timers, event listeners, helper classes, etc. are all captured.
             foreach (var plugin in Rocket.Core.R.Plugins.GetPlugins())
             {
-                if (plugin.GetType().Assembly == typeof(LagTracePlugin).Assembly) continue;
-                foreach (var m in TargetMethods)
-                    TryPatch(h, plugin.GetType(), m, plugin.Name, TrackerCategory.Plugin);
+                var asm = plugin.GetType().Assembly;
+                if (asm == typeof(LagTracePlugin).Assembly) continue;
+
+                var label = plugin.Name;
+                foreach (var type in GetPatchableTypes(asm))
+                foreach (var mi in GetPatchableMethods(type))
+                {
+                    if (TryPatch(h, mi, label, TrackerCategory.Plugin))
+                        pluginMethods++;
+                }
             }
 
-            // Unturned engine managers
+            // ── 2. RocketCommandManager.Execute — one patch for all commands ──────
+            // Captures every /command invocation with its full command string so
+            // slow commands are immediately visible in /lagtop.
+            PatchCommandManager(h);
+
+            // ── 3. Curated Unturned engine manager loops ─────────────────────────
             var asmCs = AppDomain.CurrentDomain.GetAssemblies()
                 .FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
-            if (asmCs == null) { Logger.Log("[LagTrace] Assembly-CSharp not found."); return; }
 
-            foreach (var typeName in UnturnedManagerTypeNames)
+            if (asmCs == null)
             {
-                var t = asmCs.GetType(typeName);
-                if (t == null) continue;
-                foreach (var m in TargetMethods)
-                    TryPatch(h, t, m, $"[Engine] {t.Name}", TrackerCategory.Engine);
+                Logger.Log("[LagTrace] Warning: Assembly-CSharp not found — engine managers skipped.");
+            }
+            else
+            {
+                foreach (var typeName in UnturnedManagerTypeNames)
+                {
+                    var t = asmCs.GetType(typeName);
+                    if (t == null) continue;
+                    foreach (var loopMethod in UnityLoopMethods)
+                    {
+                        var mi = t.GetMethod(loopMethod,
+                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                        if (mi == null) continue;
+                        if (TryPatch(h, mi, $"[Engine] {t.Name}", TrackerCategory.Engine))
+                            engineMethods++;
+                    }
+                }
             }
 
-            Logger.Log($"[LagTrace] Instrumented {_labels.Count} methods.");
+            Logger.Log($"[LagTrace] Patched {pluginMethods} plugin methods + {engineMethods} engine methods.");
         }
 
-        private static void TryPatch(Harmony h, Type t, string method,
-                                     string label, TrackerCategory cat)
+        // ── Assembly scanner helpers ─────────────────────────────────────────────
+
+        private static IEnumerable<Type> GetPatchableTypes(Assembly asm)
         {
-            var mi = t.GetMethod(method,
-                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-            if (mi == null) return;
+            Type[] types;
+            try { types = asm.GetTypes(); }
+            catch (ReflectionTypeLoadException ex) { types = ex.Types; } // partial load is fine
+            return types.Where(t => t != null && t.IsClass && !t.IsAbstract);
+        }
+
+        private static IEnumerable<MethodInfo> GetPatchableMethods(Type t)
+        {
+            MethodInfo[] methods;
+            try
+            {
+                methods = t.GetMethods(
+                    BindingFlags.Instance | BindingFlags.Static |
+                    BindingFlags.Public   | BindingFlags.NonPublic |
+                    BindingFlags.DeclaredOnly); // DeclaredOnly avoids patching inherited Object methods
+            }
+            catch { return Enumerable.Empty<MethodInfo>(); }
+
+            return methods.Where(m =>
+                !m.IsAbstract &&
+                !m.IsGenericMethodDefinition &&      // Harmony cannot patch open generics
+                !m.IsSpecialName &&                  // skips get_Prop / set_Prop / add_Event / remove_Event
+                !m.Name.StartsWith("<") &&           // skips compiler-generated lambdas / iterators
+                m.GetMethodBody() != null);          // skips extern / native methods
+        }
+
+        // ── Command timing patch ─────────────────────────────────────────────────
+
+        private static void PatchCommandManager(Harmony h)
+        {
+            // Rocket.Core.Commands.RocketCommandManager.Execute(IRocketPlayer, string)
+            var rocketCoreAsm = AppDomain.CurrentDomain.GetAssemblies()
+                .FirstOrDefault(a => a.GetName().Name == "Rocket.Core");
+            if (rocketCoreAsm == null) return;
+
+            var managerType = rocketCoreAsm.GetType("Rocket.Core.Commands.RocketCommandManager");
+            if (managerType == null) return;
+
+            var executeMethod = managerType.GetMethod("Execute",
+                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                null,
+                new[] { typeof(IRocketPlayer), typeof(string) },
+                null);
+            if (executeMethod == null) return;
+
+            try
+            {
+                h.Patch(executeMethod,
+                    prefix:  new HarmonyMethod(typeof(HarmonyPatcher), nameof(CommandPrefix)),
+                    postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(CommandPostfix)));
+                Logger.Log("[LagTrace] Patched RocketCommandManager.Execute.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"[LagTrace] Cannot patch RocketCommandManager.Execute: {ex.Message}");
+            }
+        }
+
+        // ── Patch helpers ────────────────────────────────────────────────────────
+
+        private static bool TryPatch(Harmony h, MethodInfo mi, string label, TrackerCategory cat)
+        {
             try
             {
                 h.Patch(mi,
                     prefix:  new HarmonyMethod(typeof(HarmonyPatcher), nameof(Prefix)),
                     postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Postfix)));
-                _labels[$"{t.Name}.{method}"] = (label, cat);
+
+                var key = $"{mi.DeclaringType?.Name}.{mi.Name}";
+                _labels[key] = (label, cat);
+                return true;
             }
-            catch (Exception ex)
+            catch
             {
-                Logger.Log($"[LagTrace] Cannot patch {t.Name}.{method}: {ex.Message}");
+                // Swallow silently — some methods are un-patchable (PInvoke, already-patched, etc.)
+                return false;
             }
         }
 
-        // These must be public so Harmony can invoke them across assemblies.
+        // ── Harmony callbacks ────────────────────────────────────────────────────
+
+        // Generic method timer — used for all plugin and engine methods.
         public static void Prefix(ref object __state) => __state = Stopwatch.StartNew();
 
         public static void Postfix(MethodBase __originalMethod, object __state)
@@ -285,6 +382,19 @@ namespace LagTrace
             sw.Stop();
             Timings.Record($"{__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}",
                            sw.ElapsedTicks);
+        }
+
+        // Command-specific timer — key includes the command string for easy identification.
+        public static void CommandPrefix(string command, ref object __state)
+            => __state = (Stopwatch.StartNew(), command?.Trim() ?? "?");
+
+        public static void CommandPostfix(object __state)
+        {
+            if (!(__state is ValueTuple<Stopwatch, string> t)) return;
+            t.Item1.Stop();
+            // Key format: "/commandname" so it sorts near the top and is obvious in /lagtop.
+            var cmdName = t.Item2.Split(' ')[0].ToLowerInvariant();
+            Timings.Record($"/command:{cmdName}", t.Item1.ElapsedTicks);
         }
     }
 
