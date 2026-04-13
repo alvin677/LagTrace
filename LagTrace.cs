@@ -34,7 +34,10 @@ namespace LagTrace
         {
             Instance = this;
             _harmony = new Harmony("com.lagtrace");
-            gameObject.AddComponent<FrameTimingComponent>();
+            if (!SDG.Unturned.Level.isLoaded)
+            {
+                gameObject.AddComponent<FrameTimingComponent>(); // only add once - prevent memleak from reloading
+            }
             HarmonyPatcher.PatchAll(_harmony);
 
             if (Configuration.Instance.AutoPrint)
@@ -214,7 +217,7 @@ namespace LagTrace
                     methodMs[kv.Key] = (kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency, kv.Value.Calls);
             }
 
-            var totals  = new Dictionary<string, PluginAcc>(32);
+            var totals = new Dictionary<string, PluginAcc>(32);
             double grandMs = 0;
 
             foreach (var kv in methodMs)
@@ -224,7 +227,7 @@ namespace LagTrace
                 if (filter.HasValue && cat != filter.Value) continue;
                 if (!totals.TryGetValue(label, out var acc))
                     totals[label] = acc = new PluginAcc { Cat = cat };
-                acc.Ms    += kv.Value.ms;
+                acc.Ms += kv.Value.ms;
                 acc.Calls += kv.Value.calls;
             }
 
@@ -233,10 +236,10 @@ namespace LagTrace
             return totals
                 .Select(kv => new PluginEntry
                 {
-                    Label    = kv.Key,
-                    TotalMs  = kv.Value.Ms,
-                    Calls    = kv.Value.Calls,
-                    Pct      = kv.Value.Ms * 100.0 / grandMs,
+                    Label = kv.Key,
+                    TotalMs = kv.Value.Ms,
+                    Calls = kv.Value.Calls,
+                    Pct = kv.Value.Ms * 100.0 / grandMs,
                     Category = kv.Value.Cat,
                 })
                 .OrderByDescending(e => e.TotalMs)
@@ -269,16 +272,16 @@ namespace LagTrace
         {
             private readonly long[] _utc;   // DateTime.UtcNow.Ticks at call time
             private readonly long[] _ticks; // Stopwatch elapsed ticks for this call
-            private int  _head;
-            private int  _count;
+            private int _head;
+            private int _count;
             private readonly int _cap;
 
             public WindowRing(int capacity) { _cap = capacity; _utc = new long[capacity]; _ticks = new long[capacity]; }
 
             public void Push(long utcTicks, long elapsedTicks)
             {
-                int idx     = _head % _cap;
-                _utc[idx]   = utcTicks;
+                int idx = _head % _cap;
+                _utc[idx] = utcTicks;
                 _ticks[idx] = elapsedTicks;
                 _head++;
                 if (_count < _cap) _count++;
