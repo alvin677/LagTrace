@@ -70,10 +70,12 @@ namespace LagTrace
 
     public class LagTraceConfig : IRocketPluginConfiguration
     {
-        public int WindowSeconds = 60;
-        public float SpikeThresholdMs = 50f;
-        public bool AutoPrint = false;
-        public int TopN = 10;
+        public bool AutoPrint;
+        public int WindowSeconds;
+        public int TopN;
+        public float SpikeThresholdMs;
+
+        public string[] CustomNameSpaces;
 
         public void LoadDefaults()
         {
@@ -81,6 +83,7 @@ namespace LagTrace
             SpikeThresholdMs = 50f;
             AutoPrint = false;
             TopN = 10;
+            CustomNameSpaces = new string[] { "Rocket.Core.Permissions.RocketPermissionsManager", "Rocket.Core.Utils.TaskDispatcher" };
         }
     }
 
@@ -363,6 +366,7 @@ namespace LagTrace
         {
             int pluginMethods = 0;
             int engineMethods = 0;
+            int customMethods = 0;
 
             // ── 1. All methods in every plugin assembly ───────────────────────────
             // We scan the whole assembly rather than just the plugin's root type so
@@ -418,8 +422,29 @@ namespace LagTrace
                     }
                 }
             }
+            foreach (var typeName in LagTracePlugin.Instance.Configuration.Instance.CustomNameSpaces)
+            {
+                var t = asmCs.GetType(typeName);
+                if (t == null) continue;
+                var asm = t.Assembly;
 
-            Logger.Log($"[LagTrace] Patched {pluginMethods} plugin methods + {engineMethods} engine methods.");
+                try // slightly slower, but prevents total break when plugins use outdated references
+                {
+                    foreach (var type in GetPatchableTypes(asm))
+                        try
+                        {
+                            foreach (var mi in GetPatchableMethods(type))
+                            {
+                                if (TryPatch(h, mi, typeName, TrackerCategory.Plugin))
+                                    customMethods++;
+                            }
+                        }
+                        catch { }
+                }
+                catch { }
+            }
+
+            Logger.Log($"[LagTrace] Patched {pluginMethods} plugin methods + {engineMethods} engine methods + {customMethods} custom methods.");
         }
 
         // ── Assembly scanner helpers ─────────────────────────────────────────────
@@ -494,7 +519,7 @@ namespace LagTrace
                     prefix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Prefix)),
                     postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Postfix)));
 
-                var key = $"{mi.DeclaringType?.Name}.{mi.Name}";
+                var key = $"{mi.DeclaringType?.FullName}.{mi.Name}";
                 _labels[key] = (label, cat);
                 return true;
             }
@@ -506,16 +531,20 @@ namespace LagTrace
         }
 
         // ── Harmony callbacks ────────────────────────────────────────────────────
-
-        // Generic method timer — used for all plugin and engine methods.
-        public static void Prefix(ref object __state) => __state = Stopwatch.StartNew();
-
-        public static void Postfix(MethodBase __originalMethod, object __state)
+        public struct TimingState
         {
-            if (!(__state is Stopwatch sw)) return;
-            sw.Stop();
-            Timings.Record($"{__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}",
-                           sw.ElapsedTicks);
+            public long Start;
+        }
+        // Generic method timer — used for all plugin and engine methods.
+        public static void Prefix(ref TimingState __state)
+        {
+            __state.Start = Stopwatch.GetTimestamp();
+        }
+
+        public static void Postfix(MethodBase __originalMethod, TimingState __state)
+        {
+            long elapsed = Stopwatch.GetTimestamp() - __state.Start;
+            Timings.Record($"{__originalMethod.DeclaringType?.FullName}.{__originalMethod.Name}", elapsed);
         }
 
         // Command-specific timer — key includes the command string for easy identification.
