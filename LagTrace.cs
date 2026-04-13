@@ -373,12 +373,20 @@ namespace LagTrace
                 if (asm == typeof(LagTracePlugin).Assembly) continue;
 
                 var label = plugin.Name;
-                foreach (var type in GetPatchableTypes(asm))
-                    foreach (var mi in GetPatchableMethods(type))
-                    {
-                        if (TryPatch(h, mi, label, TrackerCategory.Plugin))
-                            pluginMethods++;
-                    }
+                try // slightly slower, but prevents total break when plugins use outdated references
+                {
+                    foreach (var type in GetPatchableTypes(asm))
+                        try
+                        {
+                            foreach (var mi in GetPatchableMethods(type))
+                            {
+                                if (TryPatch(h, mi, label, TrackerCategory.Plugin))
+                                    pluginMethods++;
+                            }
+                        }
+                        catch { }
+                }
+                catch { }
             }
 
             // ── 2. RocketCommandManager.Execute — one patch for all commands ──────
