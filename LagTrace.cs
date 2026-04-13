@@ -34,10 +34,8 @@ namespace LagTrace
         {
             Instance = this;
             _harmony = new Harmony("com.lagtrace");
-            if (!SDG.Unturned.Level.isLoaded)
-            {
-                gameObject.AddComponent<FrameTimingComponent>(); // only add once - prevent memleak from reloading
-            }
+            if (GetComponent<FrameTimingComponent>() == null)
+                gameObject.AddComponent<FrameTimingComponent>(); // only add once. Prevent memleak.
             HarmonyPatcher.PatchAll(_harmony);
 
             if (Configuration.Instance.AutoPrint)
@@ -565,16 +563,34 @@ namespace LagTrace
         }
 
         // Command-specific timer — key includes the command string for easy identification.
-        public static void CommandPrefix(string command, ref object __state)
-            => __state = (Stopwatch.StartNew(), command?.Trim() ?? "?");
-
-        public static void CommandPostfix(object __state)
+        public struct CommandState
         {
-            if (!(__state is ValueTuple<Stopwatch, string> t)) return;
-            t.Item1.Stop();
+            public long Start;
+            public string Command;
+        }
+        public static void CommandPrefix(string command, ref CommandState __state)
+        {
+            __state.Start = Stopwatch.GetTimestamp();
+            __state.Command = command ?? "?";
+        }
+
+        public static void CommandPostfix(CommandState __state)
+        {
+            long elapsed = Stopwatch.GetTimestamp() - __state.Start;
             // Key format: "/commandname" so it sorts near the top and is obvious in /lagtop.
-            var cmdName = t.Item2.Split(' ')[0].ToLowerInvariant();
-            Timings.Record($"/command:{cmdName}", t.Item1.ElapsedTicks);
+            var cmdName = ExtractCommandName(__state.Command);
+            Timings.Record(string.Intern($"/command:{cmdName}"), elapsed);
+        }
+        private static string ExtractCommandName(string command)
+        {
+            if (string.IsNullOrEmpty(command))
+                return "?";
+
+            int len = 0;
+            while (len < command.Length && command[len] != ' ')
+                len++;
+
+            return command.Substring(0, len).ToLowerInvariant();
         }
     }
 
