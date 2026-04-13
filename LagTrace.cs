@@ -45,7 +45,7 @@ namespace LagTrace
                     Configuration.Instance.WindowSeconds,
                     Configuration.Instance.WindowSeconds);
 
-            Logger.Log("[LagTrace] Loaded. Commands: /lag  /lagtop  /lagplugins  /lagspike  /lagreset");
+            Logger.Log("[LagTrace] Loaded. Commands: /lag | /lagtop 20 10s | /lagplugins 20 10s | /lagspike | /lagreset");
         }
 
         protected override void Unload()
@@ -436,7 +436,7 @@ namespace LagTrace
                         {
                             foreach (var mi in GetPatchableMethods(type))
                             {
-                                if (TryPatch(h, mi, asm.FullName, TrackerCategory.Plugin))
+                                if (TryPatch(h, mi, asm.FullName, TrackerCategory.Core))
                                     customMethods++;
                             }
                         }
@@ -454,7 +454,7 @@ namespace LagTrace
                 {
                     foreach (var mi in GetPatchableMethods(type))
                     {
-                        if (TryPatch(h, mi, type.Name, TrackerCategory.Plugin))
+                        if (TryPatch(h, mi, type.FullName, TrackerCategory.Core))
                             customMethods++;
                     }
                 }
@@ -746,7 +746,18 @@ namespace LagTrace
             {
                 if (e.Category != lastCat)
                 {
-                    sb.AppendLine(e.Category == TrackerCategory.Engine ? "  ── Unturned engine ──" : "  ── Rocket plugins ──");
+                    switch (e.Category)
+                    {
+                        case TrackerCategory.Engine:
+                            sb.AppendLine("  ── Unturned engine ──");
+                            break;
+                        case TrackerCategory.Plugin:
+                            sb.AppendLine("  ── Rocket plugins ──");
+                            break;
+                        default:
+                            sb.AppendLine("  ── Other ──");
+                            break;
+                    }
                     lastCat = e.Category;
                 }
                 int f = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0);
