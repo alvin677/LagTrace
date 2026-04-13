@@ -434,7 +434,7 @@ namespace LagTrace
                         {
                             foreach (var mi in GetPatchableMethods(type))
                             {
-                                if (TryPatch(h, mi, asm.FullName, TrackerCategory.Core))
+                                if (TryPatch(h, mi, type.FullName, TrackerCategory.Core))
                                     customMethods++;
                             }
                         }
