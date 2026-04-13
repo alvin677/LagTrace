@@ -424,9 +424,8 @@ namespace LagTrace
             }
             foreach (var typeName in LagTracePlugin.Instance.Configuration.Instance.CustomNameSpaces)
             {
-                var t = asmCs.GetType(typeName);
-                if (t == null) continue;
-                var asm = t.Assembly;
+                var asm = AppDomain.CurrentDomain.GetAssemblies().First(a => a.GetType(typeName) != null);
+                if (asm == null) continue;
 
                 try // slightly slower, but prevents total break when plugins use outdated references
                 {
