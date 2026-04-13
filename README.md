@@ -51,8 +51,8 @@ into a 20-slot ring buffer — inspectable with `/lagspike`.
 | Command | Permission | Description |
 |---|---|---|
 | `/lag` | `lagtrace.lag` | Quick snapshot: TPS, frame time, top 5 methods |
-| `/lagtop [n] [avg]` | `lagtrace.lagtop` | Top N methods. Add `avg` to sort by average call time instead of total |
-| `/lagplugins [n]` | `lagtrace.lagplugins` | CPU % attributed to each plugin |
+| `/lagtop [n] [avg] [time]` | `lagtrace.lagtop` | Top N methods. Add `avg` to sort by average call time instead of total |
+| `/lagplugins [n] [time]` | `lagtrace.lagplugins` | CPU % attributed to each plugin |
 | `/lagspike` | `lagtrace.lagspike` | Last spike call stack |
 | `/lagspike list` | `lagtrace.lagspike` | List all recorded spikes (timestamp + ms) |
 | `/lagreset` | `lagtrace.reset` | Clear all accumulated data |
@@ -67,6 +67,11 @@ into a 20-slot ring buffer — inspectable with `/lagspike`.
 <SpikeThresholdMs>50</SpikeThresholdMs>     <!-- ms to trigger spike capture -->
 <AutoPrint>false</AutoPrint>                <!-- auto-log top 10 each window -->
 <TopN>10</TopN>                             <!-- default rows -->
+<CustomAssemblies />                        <!-- Add entire custom assemblies, like Rocket.Core -->
+<CustomNameSpaces>                          <!-- Add custom classes from assemblies. Listens to all possible functions within. -->
+  <string>Rocket.Core.Permissions.RocketPermissionsManager</string>
+  <string>Rocket.Core.Utils.TaskDispatcher</string>
+</CustomNameSpaces>
 ```
 
 ---
