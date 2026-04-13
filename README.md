@@ -9,9 +9,9 @@ Tells you **which code is eating your tick budget** without touching a productio
 
 ## How it works
 
-LagTrace runs two complementary collection strategies in parallel:
+LagTrace runs ~~two~~ complementary collection strategies in parallel:
 
-### 1 · Stack sampler (like Spark / async-profiler)
+### ~~1 · Stack sampler (like Spark / async-profiler)~~
 A background thread suspends the main Unity thread every **5 ms** (configurable),
 captures a `StackTrace`, and increments hit counters per method.
 
