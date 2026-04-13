@@ -67,17 +67,17 @@ namespace LagTrace
 
     public class LagTraceConfig : IRocketPluginConfiguration
     {
-        public int   WindowSeconds    = 60;
+        public int WindowSeconds = 60;
         public float SpikeThresholdMs = 50f;
-        public bool  AutoPrint        = false;
-        public int   TopN             = 10;
+        public bool AutoPrint = false;
+        public int TopN = 10;
 
         public void LoadDefaults()
         {
-            WindowSeconds    = 60;
+            WindowSeconds = 60;
             SpikeThresholdMs = 50f;
-            AutoPrint        = false;
-            TopN             = 10;
+            AutoPrint = false;
+            TopN = 10;
         }
     }
 
@@ -130,7 +130,7 @@ namespace LagTrace
             try { snap = new Dictionary<string, Bucket>(_b); }
             finally { _rwl.ExitReadLock(); }
 
-            var totals  = new Dictionary<string, PluginAcc>(32);
+            var totals = new Dictionary<string, PluginAcc>(32);
             double grandMs = 0;
 
             foreach (var kv in snap)
@@ -143,7 +143,7 @@ namespace LagTrace
 
                 if (!totals.TryGetValue(label, out var acc))
                     totals[label] = acc = new PluginAcc { Cat = cat };
-                acc.Ms    += ms;
+                acc.Ms += ms;
                 acc.Calls += kv.Value.Calls;
             }
 
@@ -152,10 +152,10 @@ namespace LagTrace
             return totals
                 .Select(kv => new PluginEntry
                 {
-                    Label    = kv.Key,
-                    TotalMs  = kv.Value.Ms,
-                    Calls    = kv.Value.Calls,
-                    Pct      = kv.Value.Ms * 100.0 / grandMs,
+                    Label = kv.Key,
+                    TotalMs = kv.Value.Ms,
+                    Calls = kv.Value.Calls,
+                    Pct = kv.Value.Ms * 100.0 / grandMs,
                     Category = kv.Value.Cat,
                 })
                 .OrderByDescending(e => e.TotalMs)
@@ -235,8 +235,8 @@ namespace LagTrace
 
         public static void PatchAll(Harmony h)
         {
-            int pluginMethods  = 0;
-            int engineMethods  = 0;
+            int pluginMethods = 0;
+            int engineMethods = 0;
 
             // ── 1. All methods in every plugin assembly ───────────────────────────
             // We scan the whole assembly rather than just the plugin's root type so
@@ -248,11 +248,11 @@ namespace LagTrace
 
                 var label = plugin.Name;
                 foreach (var type in GetPatchableTypes(asm))
-                foreach (var mi in GetPatchableMethods(type))
-                {
-                    if (TryPatch(h, mi, label, TrackerCategory.Plugin))
-                        pluginMethods++;
-                }
+                    foreach (var mi in GetPatchableMethods(type))
+                    {
+                        if (TryPatch(h, mi, label, TrackerCategory.Plugin))
+                            pluginMethods++;
+                    }
             }
 
             // ── 2. RocketCommandManager.Execute — one patch for all commands ──────
@@ -305,7 +305,7 @@ namespace LagTrace
             {
                 methods = t.GetMethods(
                     BindingFlags.Instance | BindingFlags.Static |
-                    BindingFlags.Public   | BindingFlags.NonPublic |
+                    BindingFlags.Public | BindingFlags.NonPublic |
                     BindingFlags.DeclaredOnly); // DeclaredOnly avoids patching inherited Object methods
             }
             catch { return Enumerable.Empty<MethodInfo>(); }
@@ -340,7 +340,7 @@ namespace LagTrace
             try
             {
                 h.Patch(executeMethod,
-                    prefix:  new HarmonyMethod(typeof(HarmonyPatcher), nameof(CommandPrefix)),
+                    prefix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(CommandPrefix)),
                     postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(CommandPostfix)));
                 Logger.Log("[LagTrace] Patched RocketCommandManager.Execute.");
             }
@@ -357,7 +357,7 @@ namespace LagTrace
             try
             {
                 h.Patch(mi,
-                    prefix:  new HarmonyMethod(typeof(HarmonyPatcher), nameof(Prefix)),
+                    prefix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Prefix)),
                     postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Postfix)));
 
                 var key = $"{mi.DeclaringType?.Name}.{mi.Name}";
@@ -431,7 +431,7 @@ namespace LagTrace
             lock (_lock)
             {
                 _ring[_head % MaxSpikes] = new SpikeRecord
-                    { TimestampUtc = DateTime.UtcNow, FrameMs = frameMs, Stack = frames };
+                { TimestampUtc = DateTime.UtcNow, FrameMs = frameMs, Stack = frames };
                 _head++;
                 _count = Math.Min(_count + 1, MaxSpikes);
             }
@@ -465,9 +465,9 @@ namespace LagTrace
 
         private void LateUpdate()
         {
-            float now   = Time.realtimeSinceStartup;
+            float now = Time.realtimeSinceStartup;
             float delta = (now - _lastTime) * 1000f;
-            _lastTime   = now;
+            _lastTime = now;
             if (delta > 0f) LagTracePlugin.OnFrameComplete(delta);
         }
     }
@@ -486,12 +486,12 @@ namespace LagTrace
         public void Execute(IRocketPlayer caller, string[] args)
         {
             var top = Timings.GetTop(5);
-            var sb  = new StringBuilder();
+            var sb = new StringBuilder();
             sb.AppendLine($"[LagTrace] TPS: {1f / Time.smoothDeltaTime:F1}  Frame: {Time.smoothDeltaTime * 1000f:F1}ms");
             if (top.Count == 0) sb.AppendLine("  (no data yet)");
             else foreach (var e in top)
-                sb.AppendLine($"  {Trunc(e.Name, 52)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  x{e.Calls}");
-            Reply(caller, sb.ToString());
+                    sb.AppendLine($"  {CommandHelpers.Trunc(e.Name, 52)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  x{e.Calls}");
+            CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
@@ -516,8 +516,8 @@ namespace LagTrace
             sb.AppendLine($"[LagTrace] Top {n} ({(byAvg ? "avg" : "total")}):");
             if (entries.Count == 0) sb.AppendLine("  (no data yet)");
             else foreach (var e in entries)
-                sb.AppendLine($"  {Trunc(e.Name, 46)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  x{e.Calls}");
-            Reply(caller, sb.ToString());
+                    sb.AppendLine($"  {CommandHelpers.Trunc(e.Name, 46)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  x{e.Calls}");
+            CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
@@ -534,11 +534,11 @@ namespace LagTrace
             foreach (var a in args)
             {
                 if (int.TryParse(a, out int p)) n = Math.Max(1, Math.Min(p, 50));
-                else if (a.Equals("engine",  StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Engine;
+                else if (a.Equals("engine", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Engine;
                 else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Plugin;
             }
             var entries = Timings.GetPluginTotals(n, filter);
-            if (entries.Count == 0) { Reply(caller, "[LagTrace] No data yet."); return; }
+            if (entries.Count == 0) { CommandHelpers.Reply(caller, "[LagTrace] No data yet."); return; }
 
             var sb = new StringBuilder();
             string fl = filter == null ? "all" : filter == TrackerCategory.Engine ? "engine" : "plugins";
@@ -562,9 +562,9 @@ namespace LagTrace
                 }
                 int f = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0);
                 string bar = new string('\u2588', f) + new string('\u2591', 20 - f);
-                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {e.TotalMs,7:F0}ms  {Trunc(e.Label, 32)}  x{e.Calls}");
+                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {e.TotalMs,7:F0}ms  {CommandHelpers.Trunc(e.Label, 32)}  x{e.Calls}");
             }
-            Reply(caller, sb.ToString());
+            CommandHelpers.Reply(caller, sb.ToString());
         }
     }
 
@@ -581,24 +581,24 @@ namespace LagTrace
             if (list)
             {
                 var all = LagTracePlugin.Spikes.GetAll();
-                if (all.Count == 0) { Reply(caller, "[LagTrace] No spikes yet."); return; }
+                if (all.Count == 0) { CommandHelpers.Reply(caller, "[LagTrace] No spikes yet."); return; }
                 var sb = new StringBuilder();
                 sb.AppendLine("[LagTrace] Recent spikes:");
                 foreach (var s in all) sb.AppendLine($"  {s.TimestampUtc:HH:mm:ss}  {s.FrameMs:F1}ms");
-                Reply(caller, sb.ToString());
+                CommandHelpers.Reply(caller, sb.ToString());
                 return;
             }
             var spike = LagTracePlugin.Spikes.GetLast();
-            if (spike == null) { Reply(caller, "[LagTrace] No spikes yet."); return; }
+            if (spike == null) { CommandHelpers.Reply(caller, "[LagTrace] No spikes yet."); return; }
             var out2 = new StringBuilder();
             out2.AppendLine($"[LagTrace] Spike {spike.TimestampUtc:HH:mm:ss} UTC  {spike.FrameMs:F1}ms");
             out2.AppendLine("  Stack (top = leaf):");
             int shown = Math.Min(spike.Stack.Length, 20);
             for (int i = 0; i < shown; i++)
-                out2.AppendLine($"  [{i,2}] {Trunc(spike.Stack[i], 70)}");
+                out2.AppendLine($"  [{i,2}] {CommandHelpers.Trunc(spike.Stack[i], 70)}");
             if (spike.Stack.Length > shown)
                 out2.AppendLine($"  ... +{spike.Stack.Length - shown} frames");
-            Reply(caller, out2.ToString());
+            CommandHelpers.Reply(caller, out2.ToString());
         }
     }
 
@@ -612,7 +612,7 @@ namespace LagTrace
         public void Execute(IRocketPlayer caller, string[] args)
         {
             Timings.Reset();
-            Reply(caller, "[LagTrace] Data cleared.");
+            CommandHelpers.Reply(caller, "[LagTrace] Data cleared.");
         }
     }
 
@@ -630,13 +630,13 @@ namespace LagTrace
                     Rocket.Unturned.Chat.UnturnedChat.Say(player, message, Color.cyan));
         }
 
-        public static string Truncate(string s, int max) =>
+        public static string Trunc(string s, int max) =>
             s == null ? "" : s.Length <= max ? s : "\u2026" + s.Substring(s.Length - (max - 1));
     }
 
     public abstract class CommandBase
     {
         protected static void Reply(IRocketPlayer p, string msg) => CommandHelpers.Reply(p, msg);
-        protected static string Trunc(string s, int n) => CommandHelpers.Truncate(s, n);
+        protected static string Trunc(string s, int n) => CommandHelpers.Trunc(s, n);
     }
 }
