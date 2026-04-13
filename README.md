@@ -104,5 +104,5 @@ into a 20-slot ring buffer — inspectable with `/lagspike`.
 
 - [ ] `/lag` TPS graph (last 60 s rolling)
 - [ ] Web UI (local HTTP server, similar to Spark's flame graph)
-- [ ] Per-player command timings (track cost of heavy commands)
+- [X] Per-player command timings (track cost of heavy commands)
 - [ ] Configurable sampler depth cap
