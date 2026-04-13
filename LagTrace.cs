@@ -75,6 +75,7 @@ namespace LagTrace
         public int TopN;
         public float SpikeThresholdMs;
 
+        public string[] CustomAssemblies;
         public string[] CustomNameSpaces;
 
         public void LoadDefaults()
@@ -83,6 +84,7 @@ namespace LagTrace
             SpikeThresholdMs = 50f;
             AutoPrint = false;
             TopN = 10;
+            CustomAssemblies = new string[] { "Rocket.Core" };
             CustomNameSpaces = new string[] { "Rocket.Core.Permissions.RocketPermissionsManager", "Rocket.Core.Utils.TaskDispatcher" };
         }
     }
@@ -422,9 +424,9 @@ namespace LagTrace
                     }
                 }
             }
-            foreach (var typeName in LagTracePlugin.Instance.Configuration.Instance.CustomNameSpaces)
+            foreach (var asmName in LagTracePlugin.Instance.Configuration.Instance.CustomAssemblies)
             {
-                var asm = AppDomain.CurrentDomain.GetAssemblies().First(a => a.GetType(typeName) != null);
+                var asm = AppDomain.CurrentDomain.GetAssemblies().First(a => a.GetName().Name == asmName);
                 if (asm == null) continue;
 
                 try // slightly slower, but prevents total break when plugins use outdated references
@@ -434,11 +436,27 @@ namespace LagTrace
                         {
                             foreach (var mi in GetPatchableMethods(type))
                             {
-                                if (TryPatch(h, mi, typeName, TrackerCategory.Plugin))
+                                if (TryPatch(h, mi, asm.FullName, TrackerCategory.Plugin))
                                     customMethods++;
                             }
                         }
                         catch { }
+                }
+                catch { }
+            }
+            foreach (var typeName in LagTracePlugin.Instance.Configuration.Instance.CustomNameSpaces)
+            {
+                Type type = null;
+                var asm = AppDomain.CurrentDomain.GetAssemblies().First(a => (type = a.GetType(typeName)) != null);
+                if (asm == null || type == null) continue;
+
+                try // slightly slower, but prevents total break when plugins use outdated references
+                {
+                    foreach (var mi in GetPatchableMethods(type))
+                    {
+                        if (TryPatch(h, mi, type.Name, TrackerCategory.Plugin))
+                            customMethods++;
+                    }
                 }
                 catch { }
             }
