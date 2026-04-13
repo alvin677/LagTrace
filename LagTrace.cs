@@ -83,33 +83,73 @@ namespace LagTrace
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  Timings
+    //
+    //  Two parallel stores:
+    //    _lifetime  — running totals since load / last reset (existing behaviour)
+    //    _window    — per-method ring buffers of (timestamp, ticks) pairs so that
+    //                 GetTop(n, windowSecs: X) can sum only the last X seconds.
+    //
+    //  WindowEntry is a value type to keep the ring allocation compact.
+    //  Ring capacity = 60 s / 5 ms sample ≈ 12 000 entries per method, but in
+    //  practice most methods are called once per frame (~30 Hz), so 3 600 entries
+    //  covers 2 minutes — we cap at 7 200 to bound memory. If a method is called
+    //  more often the oldest entries simply fall off the ring and the window query
+    //  may be slightly shorter than requested, which is acceptable.
     // ─────────────────────────────────────────────────────────────────────────────
     public static class Timings
     {
-        private static readonly Dictionary<string, Bucket> _b = new Dictionary<string, Bucket>(128);
+        // ── Lifetime store ───────────────────────────────────────────────────────
+        private static readonly Dictionary<string, Bucket> _lifetime
+            = new Dictionary<string, Bucket>(128);
         private static readonly ReaderWriterLockSlim _rwl = new ReaderWriterLockSlim();
 
+        // ── Windowed store ───────────────────────────────────────────────────────
+        // Each method gets a fixed-size ring of timestamped tick samples.
+        private const int RingCapacity = 7200;
+        private static readonly Dictionary<string, WindowRing> _rings
+            = new Dictionary<string, WindowRing>(128);
+        private static readonly object _ringLock = new object();
+
+        // ── Record ───────────────────────────────────────────────────────────────
         public static void Record(string name, long ticks)
         {
+            long nowTicks = DateTime.UtcNow.Ticks; // cheap — just reads the clock
+
+            // Lifetime
             _rwl.EnterWriteLock();
             try
             {
-                if (!_b.TryGetValue(name, out var b)) _b[name] = b = new Bucket();
+                if (!_lifetime.TryGetValue(name, out var b)) _lifetime[name] = b = new Bucket();
                 b.TotalTicks += ticks;
                 b.Calls++;
                 if (ticks > b.MaxTicks) b.MaxTicks = ticks;
             }
             finally { _rwl.ExitWriteLock(); }
+
+            // Window ring
+            lock (_ringLock)
+            {
+                if (!_rings.TryGetValue(name, out var ring))
+                    _rings[name] = ring = new WindowRing(RingCapacity);
+                ring.Push(nowTicks, ticks);
+            }
         }
 
         public static IDisposable Start(string name) => new Scope(name);
 
-        public static List<TimingEntry> GetTop(int n, bool byAvg = false)
+        // ── Queries ───────────────────────────────────────────────────────────────
+
+        /// windowSecs == 0  →  lifetime totals (original behaviour)
+        /// windowSecs >  0  →  sum only entries in the last N seconds
+        public static List<TimingEntry> GetTop(int n, bool byAvg = false, int windowSecs = 0)
         {
+            if (windowSecs > 0)
+                return GetTopWindowed(n, byAvg, windowSecs);
+
             _rwl.EnterReadLock();
             try
             {
-                return _b.Select(kv =>
+                return _lifetime.Select(kv =>
                 {
                     double tot = kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency;
                     double avg = kv.Value.Calls > 0 ? tot / kv.Value.Calls : 0;
@@ -122,29 +162,70 @@ namespace LagTrace
             finally { _rwl.ExitReadLock(); }
         }
 
-        // Aggregate method timings up to per-plugin totals using the label registry.
-        public static List<PluginEntry> GetPluginTotals(int n, TrackerCategory? filter = null)
+        private static List<TimingEntry> GetTopWindowed(int n, bool byAvg, int windowSecs)
         {
-            _rwl.EnterReadLock();
-            Dictionary<string, Bucket> snap;
-            try { snap = new Dictionary<string, Bucket>(_b); }
-            finally { _rwl.ExitReadLock(); }
+            long cutoffTicks = DateTime.UtcNow.Ticks - (long)windowSecs * TimeSpan.TicksPerSecond;
 
-            var totals = new Dictionary<string, PluginAcc>(32);
+            Dictionary<string, WindowRing> ringSnap;
+            lock (_ringLock) { ringSnap = new Dictionary<string, WindowRing>(_rings); }
+
+            var result = new List<TimingEntry>(ringSnap.Count);
+            foreach (var kv in ringSnap)
+            {
+                WindowRing.Stats s = kv.Value.Summarise(cutoffTicks);
+                if (s.Calls == 0) continue;
+                double tot = s.TotalTicks * 1000.0 / Stopwatch.Frequency;
+                double avg = tot / s.Calls;
+                double max = s.MaxTicks * 1000.0 / Stopwatch.Frequency;
+                result.Add(new TimingEntry { Name = kv.Key, TotalMs = tot, AvgMs = avg, MaxMs = max, Calls = (int)s.Calls });
+            }
+            return result
+                .OrderByDescending(e => byAvg ? e.AvgMs : e.TotalMs)
+                .Take(n).ToList();
+        }
+
+        // Aggregate per-plugin totals; windowSecs applies the same way.
+        public static List<PluginEntry> GetPluginTotals(int n, TrackerCategory? filter = null, int windowSecs = 0)
+        {
+            // Build a method→ms map from whichever store we want.
+            Dictionary<string, (double ms, int calls)> methodMs;
+
+            if (windowSecs > 0)
+            {
+                long cutoffTicks = DateTime.UtcNow.Ticks - (long)windowSecs * TimeSpan.TicksPerSecond;
+                Dictionary<string, WindowRing> ringSnap;
+                lock (_ringLock) { ringSnap = new Dictionary<string, WindowRing>(_rings); }
+                methodMs = new Dictionary<string, (double, int)>(ringSnap.Count);
+                foreach (var kv in ringSnap)
+                {
+                    var s = kv.Value.Summarise(cutoffTicks);
+                    if (s.Calls == 0) continue;
+                    methodMs[kv.Key] = (s.TotalTicks * 1000.0 / Stopwatch.Frequency, (int)s.Calls);
+                }
+            }
+            else
+            {
+                _rwl.EnterReadLock();
+                Dictionary<string, Bucket> snap;
+                try { snap = new Dictionary<string, Bucket>(_lifetime); }
+                finally { _rwl.ExitReadLock(); }
+                methodMs = new Dictionary<string, (double, int)>(snap.Count);
+                foreach (var kv in snap)
+                    methodMs[kv.Key] = (kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency, kv.Value.Calls);
+            }
+
+            var totals  = new Dictionary<string, PluginAcc>(32);
             double grandMs = 0;
 
-            foreach (var kv in snap)
+            foreach (var kv in methodMs)
             {
-                double ms = kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency;
-                grandMs += ms;
-
+                grandMs += kv.Value.ms;
                 if (!HarmonyPatcher.TryGetLabel(kv.Key, out var label, out var cat)) continue;
                 if (filter.HasValue && cat != filter.Value) continue;
-
                 if (!totals.TryGetValue(label, out var acc))
                     totals[label] = acc = new PluginAcc { Cat = cat };
-                acc.Ms += ms;
-                acc.Calls += kv.Value.Calls;
+                acc.Ms    += kv.Value.ms;
+                acc.Calls += kv.Value.calls;
             }
 
             if (grandMs <= 0) return new List<PluginEntry>();
@@ -152,10 +233,10 @@ namespace LagTrace
             return totals
                 .Select(kv => new PluginEntry
                 {
-                    Label = kv.Key,
-                    TotalMs = kv.Value.Ms,
-                    Calls = kv.Value.Calls,
-                    Pct = kv.Value.Ms * 100.0 / grandMs,
+                    Label    = kv.Key,
+                    TotalMs  = kv.Value.Ms,
+                    Calls    = kv.Value.Calls,
+                    Pct      = kv.Value.Ms * 100.0 / grandMs,
                     Category = kv.Value.Cat,
                 })
                 .OrderByDescending(e => e.TotalMs)
@@ -165,9 +246,12 @@ namespace LagTrace
         public static void Reset()
         {
             _rwl.EnterWriteLock();
-            try { _b.Clear(); }
+            try { _lifetime.Clear(); }
             finally { _rwl.ExitWriteLock(); }
+            lock (_ringLock) { _rings.Clear(); }
         }
+
+        // ── Internal types ────────────────────────────────────────────────────────
 
         private class Bucket { public long TotalTicks, MaxTicks; public int Calls; }
         private class PluginAcc { public double Ms; public long Calls; public TrackerCategory Cat; }
@@ -177,6 +261,45 @@ namespace LagTrace
             private readonly string _n; private readonly Stopwatch _sw;
             public Scope(string n) { _n = n; _sw = Stopwatch.StartNew(); }
             public void Dispose() { _sw.Stop(); Record(_n, _sw.ElapsedTicks); }
+        }
+
+        // Fixed-size ring buffer of (utcTicks, elapsedTicks) pairs.
+        // Not thread-safe on its own — callers hold _ringLock.
+        private class WindowRing
+        {
+            private readonly long[] _utc;   // DateTime.UtcNow.Ticks at call time
+            private readonly long[] _ticks; // Stopwatch elapsed ticks for this call
+            private int  _head;
+            private int  _count;
+            private readonly int _cap;
+
+            public WindowRing(int capacity) { _cap = capacity; _utc = new long[capacity]; _ticks = new long[capacity]; }
+
+            public void Push(long utcTicks, long elapsedTicks)
+            {
+                int idx     = _head % _cap;
+                _utc[idx]   = utcTicks;
+                _ticks[idx] = elapsedTicks;
+                _head++;
+                if (_count < _cap) _count++;
+            }
+
+            public struct Stats { public long TotalTicks; public long MaxTicks; public long Calls; }
+
+            // Walk entries from newest to oldest, stopping when we cross the cutoff.
+            public Stats Summarise(long cutoffUtcTicks)
+            {
+                Stats s = default;
+                for (int i = 0; i < _count; i++)
+                {
+                    int idx = (_head - 1 - i + _cap * 2) % _cap;
+                    if (_utc[idx] < cutoffUtcTicks) break; // oldest entry still in window; ring is in insertion order
+                    s.TotalTicks += _ticks[idx];
+                    if (_ticks[idx] > s.MaxTicks) s.MaxTicks = _ticks[idx];
+                    s.Calls++;
+                }
+                return s;
+            }
         }
     }
 
@@ -497,8 +620,8 @@ namespace LagTrace
 
     public class CommandLagTop : IRocketCommand
     {
-        public string Name => "lagtop"; public string Help => "Top N methods. Args: [n] [avg]";
-        public string Syntax => "/lagtop [n] [avg]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
+        public string Name => "lagtop"; public string Help => "Top N methods. Args: [n] [avg] [Xs] — X=seconds window, e.g. 10s";
+        public string Syntax => "/lagtop [n] [avg] [Xs]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
         public List<string> Aliases => new List<string> { "lt" };
         public List<string> Permissions => new List<string> { "lagtrace.lagtop" };
 
@@ -506,14 +629,19 @@ namespace LagTrace
         {
             int n = LagTracePlugin.Instance.Configuration.Instance.TopN;
             bool byAvg = false;
+            int windowSecs = 0; // 0 = lifetime
             foreach (var a in args)
             {
                 if (int.TryParse(a, out int p)) n = Math.Max(1, Math.Min(p, 50));
-                if (a.Equals("avg", StringComparison.OrdinalIgnoreCase)) byAvg = true;
+                else if (a.Equals("avg", StringComparison.OrdinalIgnoreCase)) byAvg = true;
+                else if (a.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
+                         int.TryParse(a.Substring(0, a.Length - 1), out int ws))
+                    windowSecs = Math.Max(1, Math.Min(ws, 3600)); // e.g. "10s", "60s", "1s"
             }
-            var entries = Timings.GetTop(n, byAvg);
+            var entries = Timings.GetTop(n, byAvg, windowSecs);
+            var windowLabel = windowSecs > 0 ? $"last {windowSecs}s" : "lifetime";
             var sb = new StringBuilder();
-            sb.AppendLine($"[LagTrace] Top {n} ({(byAvg ? "avg" : "total")}):");
+            sb.AppendLine($"[LagTrace] Top {n} ({(byAvg ? "avg" : "total")}, {windowLabel}):");
             if (entries.Count == 0) sb.AppendLine("  (no data yet)");
             else foreach (var e in entries)
                     sb.AppendLine($"  {CommandHelpers.Trunc(e.Name, 46)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  x{e.Calls}");
@@ -523,26 +651,30 @@ namespace LagTrace
 
     public class CommandLagPlugins : IRocketCommand
     {
-        public string Name => "lagplugins"; public string Help => "CPU per plugin. Args: [n] [engine|plugins]";
-        public string Syntax => "/lagplugins [n] [engine|plugins]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
+        public string Name => "lagplugins"; public string Help => "CPU per plugin. Args: [n] [engine|plugins] [Xs] — X=seconds window";
+        public string Syntax => "/lagplugins [n] [engine|plugins] [Xs]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
         public List<string> Aliases => new List<string> { "lp" };
         public List<string> Permissions => new List<string> { "lagtrace.lagplugins" };
 
         public void Execute(IRocketPlayer caller, string[] args)
         {
-            int n = 20; TrackerCategory? filter = null;
+            int n = 20; TrackerCategory? filter = null; int windowSecs = 0;
             foreach (var a in args)
             {
                 if (int.TryParse(a, out int p)) n = Math.Max(1, Math.Min(p, 50));
                 else if (a.Equals("engine", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Engine;
                 else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Plugin;
+                else if (a.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
+                         int.TryParse(a.Substring(0, a.Length - 1), out int ws))
+                    windowSecs = Math.Max(1, Math.Min(ws, 3600));
             }
-            var entries = Timings.GetPluginTotals(n, filter);
+            var entries = Timings.GetPluginTotals(n, filter, windowSecs);
             if (entries.Count == 0) { CommandHelpers.Reply(caller, "[LagTrace] No data yet."); return; }
 
             var sb = new StringBuilder();
+            var windowLabel = windowSecs > 0 ? $"last {windowSecs}s" : "lifetime";
             string fl = filter == null ? "all" : filter == TrackerCategory.Engine ? "engine" : "plugins";
-            sb.AppendLine($"[LagTrace] CPU by source ({fl}, top {n}):");
+            sb.AppendLine($"[LagTrace] CPU by source ({fl}, {windowLabel}, top {n}):");
 
             if (filter == null)
             {
