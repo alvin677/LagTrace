@@ -830,6 +830,95 @@ namespace LagTrace
             CommandHelpers.Reply(caller, "[LagTrace] Data cleared.");
         }
     }
+    public class CommandLagEvents : IRocketCommand
+    {
+        public string Name => "lagevents";
+        public string Help => "Find highly-subscribed events.";
+        public string Syntax => "/lagevents <asm> <namespace filter>";
+        public AllowedCaller AllowedCaller => AllowedCaller.Both;
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "lagtrace.events" };
+
+        public void Execute(IRocketPlayer caller, string[] args)
+        {
+            if (args.Length < 1)
+            {
+                CommandHelpers.Reply(caller, "[LagTrace] /lagevents [assembly] [namespaces]");
+                return;
+            }
+            Assembly asm = null;
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                if (assemblies[i].GetName().Name == args[0])
+                {
+                    asm = assemblies[i];
+                    break;
+                }
+            }
+
+            if (asm == null)
+            {
+                Logger.LogWarning(args[0]+" not found.");
+                return;
+            }
+
+            var results = new List<EventScanner.EventInfo>(128);
+
+            Type[] types;
+            try
+            {
+                types = asm.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                types = ex.Types; // includes nulls
+            }
+            for (int i = 0; i < types.Length; i++)
+            {
+                var type = types[i];
+                if (type == null)
+                    continue;
+                var ns = type.Namespace;
+
+                if (ns == null)
+                    continue;
+
+                if (args.Length > 1)
+                {
+                    bool match = false;
+                    for (int j = 1; j < args.Length; j++)
+                    {
+                        if (ns.IndexOf(args[j], StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            match = true;
+                            break;
+                        }
+                    }
+                    if (!match)
+                        continue;
+                }
+
+                EventScanner.ScanEvents(type, results);
+            }
+
+            // Sort descending by handler count
+            results.Sort((a, b) => b.Count.CompareTo(a.Count));
+
+            Logger.Log("==== Event Scan Results ====");
+
+            // Limit output (optional but recommended)
+            int max = Math.Min(results.Count, 50);
+
+            for (int i = 0; i < max; i++)
+            {
+                var r = results[i];
+                Logger.Log($"{r.Namespace}.{r.TypeName}.{r.EventName} → {r.Count}");
+            }
+
+            Logger.Log($"Total events found: {results.Count}");
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  Shared helpers
@@ -853,5 +942,71 @@ namespace LagTrace
     {
         protected static void Reply(IRocketPlayer p, string msg) => CommandHelpers.Reply(p, msg);
         protected static string Trunc(string s, int n) => CommandHelpers.Trunc(s, n);
+    }
+    public static class EventScanner
+    {
+        public struct EventInfo
+        {
+            public string Namespace;
+            public string TypeName;
+            public string EventName;
+            public int Count;
+        }
+
+        public static void ScanEvents(Type type, List<EventInfo> results)
+        {
+            if (type == null || type.ContainsGenericParameters)
+                return;
+
+            var events = type.GetEvents(BindingFlags.Static | BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            for (int i = 0; i < events.Length; i++)
+            {
+                var ev = events[i];
+
+                // Try find backing field (standard pattern)
+                var field = type.GetField(ev.Name,
+                    BindingFlags.Static | BindingFlags.Instance |
+                    BindingFlags.Public | BindingFlags.NonPublic);
+
+                if (field == null)
+                    continue;
+
+                if (!typeof(MulticastDelegate).IsAssignableFrom(field.FieldType))
+                    continue;
+
+                if (field.FieldType.ContainsGenericParameters)
+                    continue;
+
+                if (!field.IsStatic)
+                    continue; // instance events are not safely readable
+
+                MulticastDelegate del;
+
+                try
+                {
+                    del = field.GetValue(null) as MulticastDelegate;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (del == null)
+                    continue;
+
+                int count = del.GetInvocationList().Length;
+
+                if (count == 0)
+                    continue;
+
+                results.Add(new EventInfo
+                {
+                    TypeName = type.FullName,
+                    EventName = ev.Name,
+                    Count = count
+                });
+            }
+        }
     }
 }
