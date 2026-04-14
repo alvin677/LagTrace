@@ -34,8 +34,7 @@ namespace LagTrace
         {
             Instance = this;
             _harmony = new Harmony("com.lagtrace");
-            if (GetComponent<FrameTimingComponent>() == null)
-                gameObject.AddComponent<FrameTimingComponent>(); // only add once. Prevent memleak.
+            gameObject.AddComponent<FrameTimingComponent>();
             HarmonyPatcher.PatchAll(_harmony);
 
             if (Configuration.Instance.AutoPrint)
@@ -43,7 +42,7 @@ namespace LagTrace
                     Configuration.Instance.WindowSeconds,
                     Configuration.Instance.WindowSeconds);
 
-            Logger.Log("[LagTrace] Loaded. Commands: /lag | /lagtop 20 10s | /lagplugins 20 10s | /lagspike | /lagreset");
+            Logger.Log("[LagTrace] Loaded. Commands: /lag  /lagtop  /lagplugins  /lagspike  /lagreset");
         }
 
         protected override void Unload()
@@ -68,13 +67,10 @@ namespace LagTrace
 
     public class LagTraceConfig : IRocketPluginConfiguration
     {
-        public bool AutoPrint;
-        public int WindowSeconds;
-        public int TopN;
-        public float SpikeThresholdMs;
-
-        public string[] CustomAssemblies;
-        public string[] CustomNameSpaces;
+        public int WindowSeconds = 60;
+        public float SpikeThresholdMs = 50f;
+        public bool AutoPrint = false;
+        public int TopN = 10;
 
         public void LoadDefaults()
         {
@@ -82,57 +78,33 @@ namespace LagTrace
             SpikeThresholdMs = 50f;
             AutoPrint = false;
             TopN = 10;
-            CustomAssemblies = new string[] { "Rocket.Core" };
-            CustomNameSpaces = new string[] { "Rocket.Core.Permissions.RocketPermissionsManager", "Rocket.Core.Utils.TaskDispatcher" };
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  Timings
-    //
-    //  Two parallel stores:
-    //    _lifetime  — running totals since load / last reset (existing behaviour)
-    //    _window    — per-method ring buffers of (timestamp, ticks) pairs so that
-    //                 GetTop(n, windowSecs: X) can sum only the last X seconds.
-    //
-    //  WindowEntry is a value type to keep the ring allocation compact.
-    //  Ring capacity = 60 s / 5 ms sample ≈ 12 000 entries per method, but in
-    //  practice most methods are called once per frame (~30 Hz), so 3 600 entries
-    //  covers 2 minutes — we cap at 7 200 to bound memory. If a method is called
-    //  more often the oldest entries simply fall off the ring and the window query
-    //  may be slightly shorter than requested, which is acceptable.
     // ─────────────────────────────────────────────────────────────────────────────
     public static class Timings
     {
-        // ── Lifetime store ───────────────────────────────────────────────────────
-        private static readonly Dictionary<string, Bucket> _lifetime
-            = new Dictionary<string, Bucket>(128);
+        private static readonly Dictionary<string, Bucket> _b = new Dictionary<string, Bucket>(128);
         private static readonly ReaderWriterLockSlim _rwl = new ReaderWriterLockSlim();
 
-        // ── Windowed store ───────────────────────────────────────────────────────
-        // Each method gets a fixed-size ring of timestamped tick samples.
         private const int RingCapacity = 7200;
-        private static readonly Dictionary<string, WindowRing> _rings
-            = new Dictionary<string, WindowRing>(128);
+        private static readonly Dictionary<string, WindowRing> _rings = new Dictionary<string, WindowRing>(128);
         private static readonly object _ringLock = new object();
 
-        // ── Record ───────────────────────────────────────────────────────────────
         public static void Record(string name, long ticks)
         {
-            long nowTicks = DateTime.UtcNow.Ticks; // cheap — just reads the clock
-
-            // Lifetime
+            long nowTicks = DateTime.UtcNow.Ticks;
             _rwl.EnterWriteLock();
             try
             {
-                if (!_lifetime.TryGetValue(name, out var b)) _lifetime[name] = b = new Bucket();
+                if (!_b.TryGetValue(name, out var b)) _b[name] = b = new Bucket();
                 b.TotalTicks += ticks;
                 b.Calls++;
                 if (ticks > b.MaxTicks) b.MaxTicks = ticks;
             }
             finally { _rwl.ExitWriteLock(); }
-
-            // Window ring
             lock (_ringLock)
             {
                 if (!_rings.TryGetValue(name, out var ring))
@@ -143,19 +115,28 @@ namespace LagTrace
 
         public static IDisposable Start(string name) => new Scope(name);
 
-        // ── Queries ───────────────────────────────────────────────────────────────
-
-        /// windowSecs == 0  →  lifetime totals (original behaviour)
-        /// windowSecs >  0  →  sum only entries in the last N seconds
         public static List<TimingEntry> GetTop(int n, bool byAvg = false, int windowSecs = 0)
         {
             if (windowSecs > 0)
-                return GetTopWindowed(n, byAvg, windowSecs);
-
+            {
+                long cutoffTicks = DateTime.UtcNow.Ticks - (long)windowSecs * TimeSpan.TicksPerSecond;
+                Dictionary<string, WindowRing> ringSnap;
+                lock (_ringLock) { ringSnap = new Dictionary<string, WindowRing>(_rings); }
+                var windowed = new List<TimingEntry>(ringSnap.Count);
+                foreach (var kv in ringSnap)
+                {
+                    WindowRing.Stats s = kv.Value.Summarise(cutoffTicks);
+                    if (s.Calls == 0) continue;
+                    double tot = s.TotalTicks * 1000.0 / Stopwatch.Frequency;
+                    windowed.Add(new TimingEntry { Name = kv.Key, TotalMs = tot, AvgMs = tot / s.Calls,
+                        MaxMs = s.MaxTicks * 1000.0 / Stopwatch.Frequency, Calls = (int)s.Calls });
+                }
+                return windowed.OrderByDescending(e => byAvg ? e.AvgMs : e.TotalMs).Take(n).ToList();
+            }
             _rwl.EnterReadLock();
             try
             {
-                return _lifetime.Select(kv =>
+                return _b.Select(kv =>
                 {
                     double tot = kv.Value.TotalTicks * 1000.0 / Stopwatch.Frequency;
                     double avg = kv.Value.Calls > 0 ? tot / kv.Value.Calls : 0;
@@ -168,32 +149,9 @@ namespace LagTrace
             finally { _rwl.ExitReadLock(); }
         }
 
-        private static List<TimingEntry> GetTopWindowed(int n, bool byAvg, int windowSecs)
-        {
-            long cutoffTicks = DateTime.UtcNow.Ticks - (long)windowSecs * TimeSpan.TicksPerSecond;
-
-            Dictionary<string, WindowRing> ringSnap;
-            lock (_ringLock) { ringSnap = new Dictionary<string, WindowRing>(_rings); }
-
-            var result = new List<TimingEntry>(ringSnap.Count);
-            foreach (var kv in ringSnap)
-            {
-                WindowRing.Stats s = kv.Value.Summarise(cutoffTicks);
-                if (s.Calls == 0) continue;
-                double tot = s.TotalTicks * 1000.0 / Stopwatch.Frequency;
-                double avg = tot / s.Calls;
-                double max = s.MaxTicks * 1000.0 / Stopwatch.Frequency;
-                result.Add(new TimingEntry { Name = kv.Key, TotalMs = tot, AvgMs = avg, MaxMs = max, Calls = (int)s.Calls });
-            }
-            return result
-                .OrderByDescending(e => byAvg ? e.AvgMs : e.TotalMs)
-                .Take(n).ToList();
-        }
-
-        // Aggregate per-plugin totals; windowSecs applies the same way.
+        // Aggregate method timings up to per-plugin totals using the label registry.
         public static List<PluginEntry> GetPluginTotals(int n, TrackerCategory? filter = null, int windowSecs = 0)
         {
-            // Build a method→ms map from whichever store we want.
             Dictionary<string, (double ms, int calls)> methodMs;
 
             if (windowSecs > 0)
@@ -213,7 +171,7 @@ namespace LagTrace
             {
                 _rwl.EnterReadLock();
                 Dictionary<string, Bucket> snap;
-                try { snap = new Dictionary<string, Bucket>(_lifetime); }
+                try { snap = new Dictionary<string, Bucket>(_b); }
                 finally { _rwl.ExitReadLock(); }
                 methodMs = new Dictionary<string, (double, int)>(snap.Count);
                 foreach (var kv in snap)
@@ -252,12 +210,10 @@ namespace LagTrace
         public static void Reset()
         {
             _rwl.EnterWriteLock();
-            try { _lifetime.Clear(); }
+            try { _b.Clear(); }
             finally { _rwl.ExitWriteLock(); }
             lock (_ringLock) { _rings.Clear(); }
         }
-
-        // ── Internal types ────────────────────────────────────────────────────────
 
         private class Bucket { public long TotalTicks, MaxTicks; public int Calls; }
         private class PluginAcc { public double Ms; public long Calls; public TrackerCategory Cat; }
@@ -269,37 +225,26 @@ namespace LagTrace
             public void Dispose() { _sw.Stop(); Record(_n, _sw.ElapsedTicks); }
         }
 
-        // Fixed-size ring buffer of (utcTicks, elapsedTicks) pairs.
-        // Not thread-safe on its own — callers hold _ringLock.
         private class WindowRing
         {
-            private readonly long[] _utc;   // DateTime.UtcNow.Ticks at call time
-            private readonly long[] _ticks; // Stopwatch elapsed ticks for this call
-            private int _head;
-            private int _count;
+            private readonly long[] _utc;
+            private readonly long[] _ticks;
+            private int _head, _count;
             private readonly int _cap;
-
-            public WindowRing(int capacity) { _cap = capacity; _utc = new long[capacity]; _ticks = new long[capacity]; }
-
-            public void Push(long utcTicks, long elapsedTicks)
+            public WindowRing(int cap) { _cap = cap; _utc = new long[cap]; _ticks = new long[cap]; }
+            public void Push(long utc, long elapsed)
             {
-                int idx = _head % _cap;
-                _utc[idx] = utcTicks;
-                _ticks[idx] = elapsedTicks;
-                _head++;
-                if (_count < _cap) _count++;
+                int i = _head % _cap; _utc[i] = utc; _ticks[i] = elapsed;
+                _head++; if (_count < _cap) _count++;
             }
-
-            public struct Stats { public long TotalTicks; public long MaxTicks; public long Calls; }
-
-            // Walk entries from newest to oldest, stopping when we cross the cutoff.
-            public Stats Summarise(long cutoffUtcTicks)
+            public struct Stats { public long TotalTicks, MaxTicks, Calls; }
+            public Stats Summarise(long cutoff)
             {
                 Stats s = default;
                 for (int i = 0; i < _count; i++)
                 {
                     int idx = (_head - 1 - i + _cap * 2) % _cap;
-                    if (_utc[idx] < cutoffUtcTicks) break; // oldest entry still in window; ring is in insertion order
+                    if (_utc[idx] < cutoff) break;
                     s.TotalTicks += _ticks[idx];
                     if (_ticks[idx] > s.MaxTicks) s.MaxTicks = _ticks[idx];
                     s.Calls++;
@@ -319,7 +264,7 @@ namespace LagTrace
         public string Label; public double TotalMs, Pct; public long Calls; public TrackerCategory Category;
     }
 
-    public enum TrackerCategory { Plugin, Engine, Core }
+    public enum TrackerCategory { Plugin, Engine, Core, Command }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  HarmonyPatcher
@@ -366,7 +311,6 @@ namespace LagTrace
         {
             int pluginMethods = 0;
             int engineMethods = 0;
-            int customMethods = 0;
 
             // ── 1. All methods in every plugin assembly ───────────────────────────
             // We scan the whole assembly rather than just the plugin's root type so
@@ -377,20 +321,12 @@ namespace LagTrace
                 if (asm == typeof(LagTracePlugin).Assembly) continue;
 
                 var label = plugin.Name;
-                try // slightly slower, but prevents total break when plugins use outdated references
-                {
-                    foreach (var type in GetPatchableTypes(asm))
-                        try
-                        {
-                            foreach (var mi in GetPatchableMethods(type))
-                            {
-                                if (TryPatch(h, mi, label, TrackerCategory.Plugin))
-                                    pluginMethods++;
-                            }
-                        }
-                        catch { }
-                }
-                catch { }
+                foreach (var type in GetPatchableTypes(asm))
+                    foreach (var mi in GetPatchableMethods(type))
+                    {
+                        if (TryPatch(h, mi, label, TrackerCategory.Plugin))
+                            pluginMethods++;
+                    }
             }
 
             // ── 2. RocketCommandManager.Execute — one patch for all commands ──────
@@ -422,44 +358,8 @@ namespace LagTrace
                     }
                 }
             }
-            foreach (var asmName in LagTracePlugin.Instance.Configuration.Instance.CustomAssemblies)
-            {
-                var asm = AppDomain.CurrentDomain.GetAssemblies().First(a => a.GetName().Name == asmName);
-                if (asm == null) continue;
 
-                try // slightly slower, but prevents total break when plugins use outdated references
-                {
-                    foreach (var type in GetPatchableTypes(asm))
-                        try
-                        {
-                            foreach (var mi in GetPatchableMethods(type))
-                            {
-                                if (TryPatch(h, mi, type.FullName, TrackerCategory.Core))
-                                    customMethods++;
-                            }
-                        }
-                        catch { }
-                }
-                catch { }
-            }
-            foreach (var typeName in LagTracePlugin.Instance.Configuration.Instance.CustomNameSpaces)
-            {
-                Type type = null;
-                var asm = AppDomain.CurrentDomain.GetAssemblies().First(a => (type = a.GetType(typeName)) != null);
-                if (asm == null || type == null) continue;
-
-                try // slightly slower, but prevents total break when plugins use outdated references
-                {
-                    foreach (var mi in GetPatchableMethods(type))
-                    {
-                        if (TryPatch(h, mi, type.FullName, TrackerCategory.Core))
-                            customMethods++;
-                    }
-                }
-                catch { }
-            }
-
-            Logger.Log($"[LagTrace] Patched {pluginMethods} plugin methods + {engineMethods} engine methods + {customMethods} custom methods.");
+            Logger.Log($"[LagTrace] Patched {pluginMethods} plugin methods + {engineMethods} engine methods.");
         }
 
         // ── Assembly scanner helpers ─────────────────────────────────────────────
@@ -534,7 +434,7 @@ namespace LagTrace
                     prefix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Prefix)),
                     postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(Postfix)));
 
-                var key = $"{mi.DeclaringType?.FullName}.{mi.Name}";
+                var key = $"{mi.DeclaringType?.Name}.{mi.Name}";
                 _labels[key] = (label, cat);
                 return true;
             }
@@ -546,51 +446,32 @@ namespace LagTrace
         }
 
         // ── Harmony callbacks ────────────────────────────────────────────────────
-        public struct TimingState
-        {
-            public long Start;
-        }
-        // Generic method timer — used for all plugin and engine methods.
-        public static void Prefix(ref TimingState __state)
-        {
-            __state.Start = Stopwatch.GetTimestamp();
-        }
 
-        public static void Postfix(MethodBase __originalMethod, TimingState __state)
+        // Generic method timer — used for all plugin and engine methods.
+        public static void Prefix(ref object __state) => __state = Stopwatch.StartNew();
+
+        public static void Postfix(MethodBase __originalMethod, object __state)
         {
-            long elapsed = Stopwatch.GetTimestamp() - __state.Start;
-            Timings.Record($"{__originalMethod.DeclaringType?.FullName}.{__originalMethod.Name}", elapsed);
+            if (!(__state is Stopwatch sw)) return;
+            sw.Stop();
+            Timings.Record($"{__originalMethod.DeclaringType?.Name}.{__originalMethod.Name}",
+                           sw.ElapsedTicks);
         }
 
         // Command-specific timer — key includes the command string for easy identification.
-        public struct CommandState
-        {
-            public long Start;
-            public string Command;
-        }
-        public static void CommandPrefix(string command, ref CommandState __state)
-        {
-            __state.Start = Stopwatch.GetTimestamp();
-            __state.Command = command ?? "?";
-        }
+        public static void CommandPrefix(string command, ref object __state)
+            => __state = (Stopwatch.StartNew(), command?.Trim() ?? "?");
 
-        public static void CommandPostfix(CommandState __state)
+        public static void CommandPostfix(object __state)
         {
-            long elapsed = Stopwatch.GetTimestamp() - __state.Start;
-            // Key format: "/commandname" so it sorts near the top and is obvious in /lagtop.
-            var cmdName = ExtractCommandName(__state.Command);
-            Timings.Record(string.Intern($"/command:{cmdName}"), elapsed);
-        }
-        private static string ExtractCommandName(string command)
-        {
-            if (string.IsNullOrEmpty(command))
-                return "?";
-
-            int len = 0;
-            while (len < command.Length && command[len] != ' ')
-                len++;
-
-            return command.Substring(0, len).ToLowerInvariant();
+            if (!(__state is ValueTuple<Stopwatch, string> t)) return;
+            t.Item1.Stop();
+            var cmdName = t.Item2.Split(' ')[0].ToLowerInvariant();
+            var key = $"/command:{cmdName}";
+            Timings.Record(key, t.Item1.ElapsedTicks);
+            // Register so GetPluginTotals can attribute it to the Command category.
+            if (!_labels.ContainsKey(key))
+                _labels[key] = (cmdName, TrackerCategory.Command);
         }
     }
 
@@ -693,7 +574,7 @@ namespace LagTrace
 
     public class CommandLagTop : IRocketCommand
     {
-        public string Name => "lagtop"; public string Help => "Top N methods. Args: [n] [avg] [Xs] — X=seconds window, e.g. 10s";
+        public string Name => "lagtop"; public string Help => "Top N methods. Args: [n] [avg] [Xs]";
         public string Syntax => "/lagtop [n] [avg] [Xs]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
         public List<string> Aliases => new List<string> { "lt" };
         public List<string> Permissions => new List<string> { "lagtrace.lagtop" };
@@ -701,20 +582,19 @@ namespace LagTrace
         public void Execute(IRocketPlayer caller, string[] args)
         {
             int n = LagTracePlugin.Instance.Configuration.Instance.TopN;
-            bool byAvg = false;
-            int windowSecs = 0; // 0 = lifetime
+            bool byAvg = false; int windowSecs = 0;
             foreach (var a in args)
             {
                 if (int.TryParse(a, out int p)) n = Math.Max(1, Math.Min(p, 50));
                 else if (a.Equals("avg", StringComparison.OrdinalIgnoreCase)) byAvg = true;
                 else if (a.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
                          int.TryParse(a.Substring(0, a.Length - 1), out int ws))
-                    windowSecs = Math.Max(1, Math.Min(ws, 3600)); // e.g. "10s", "60s", "1s"
+                    windowSecs = Math.Max(1, Math.Min(ws, 3600));
             }
             var entries = Timings.GetTop(n, byAvg, windowSecs);
-            var windowLabel = windowSecs > 0 ? $"last {windowSecs}s" : "lifetime";
             var sb = new StringBuilder();
-            sb.AppendLine($"[LagTrace] Top {n} ({(byAvg ? "avg" : "total")}, {windowLabel}):");
+            var windowLabel2 = windowSecs > 0 ? $"last {windowSecs}s" : "lifetime";
+            sb.AppendLine($"[LagTrace] Top {n} ({(byAvg ? "avg" : "total")}, {windowLabel2}):");
             if (entries.Count == 0) sb.AppendLine("  (no data yet)");
             else foreach (var e in entries)
                     sb.AppendLine($"  {CommandHelpers.Trunc(e.Name, 46)}  {e.TotalMs:F2}ms  avg {e.AvgMs:F3}ms  max {e.MaxMs:F2}ms  x{e.Calls}");
@@ -724,8 +604,8 @@ namespace LagTrace
 
     public class CommandLagPlugins : IRocketCommand
     {
-        public string Name => "lagplugins"; public string Help => "CPU per plugin. Args: [n] [engine|plugins] [Xs] — X=seconds window";
-        public string Syntax => "/lagplugins [n] [engine|plugins] [Xs]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
+        public string Name => "lagplugins"; public string Help => "CPU per plugin. Args: [n] [engine|plugins|commands] [Xs]";
+        public string Syntax => "/lagplugins [n] [engine|plugins|commands] [Xs]"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
         public List<string> Aliases => new List<string> { "lp" };
         public List<string> Permissions => new List<string> { "lagtrace.lagplugins" };
 
@@ -735,8 +615,9 @@ namespace LagTrace
             foreach (var a in args)
             {
                 if (int.TryParse(a, out int p)) n = Math.Max(1, Math.Min(p, 50));
-                else if (a.Equals("engine", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Engine;
-                else if (a.Equals("plugins", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Plugin;
+                else if (a.Equals("engine",   StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Engine;
+                else if (a.Equals("plugins",  StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Plugin;
+                else if (a.Equals("commands", StringComparison.OrdinalIgnoreCase)) filter = TrackerCategory.Command;
                 else if (a.EndsWith("s", StringComparison.OrdinalIgnoreCase) &&
                          int.TryParse(a.Substring(0, a.Length - 1), out int ws))
                     windowSecs = Math.Max(1, Math.Min(ws, 3600));
@@ -746,7 +627,7 @@ namespace LagTrace
 
             var sb = new StringBuilder();
             var windowLabel = windowSecs > 0 ? $"last {windowSecs}s" : "lifetime";
-            string fl = filter == null ? "all" : filter == TrackerCategory.Engine ? "engine" : "plugins";
+            string fl = filter == null ? "all" : filter == TrackerCategory.Engine ? "engine" : filter == TrackerCategory.Plugin ? "plugins" : "commands";
             sb.AppendLine($"[LagTrace] CPU by source ({fl}, {windowLabel}, top {n}):");
 
             if (filter == null)
@@ -758,21 +639,18 @@ namespace LagTrace
             }
 
             TrackerCategory? lastCat = null;
-            foreach (var e in entries.OrderBy(e => e.Category).ThenByDescending(e => e.TotalMs))
+            static int CatOrder(TrackerCategory c) =>
+                c == TrackerCategory.Plugin ? 0 : c == TrackerCategory.Engine ? 1 : c == TrackerCategory.Command ? 2 : 3;
+            foreach (var e in entries.OrderBy(e => CatOrder(e.Category)).ThenByDescending(e => e.TotalMs))
             {
                 if (e.Category != lastCat)
                 {
                     switch (e.Category)
                     {
-                        case TrackerCategory.Engine:
-                            sb.AppendLine("  ── Unturned engine ──");
-                            break;
-                        case TrackerCategory.Plugin:
-                            sb.AppendLine("  ── Rocket plugins ──");
-                            break;
-                        default:
-                            sb.AppendLine("  ── Other ──");
-                            break;
+                        case TrackerCategory.Plugin:  sb.AppendLine("  ── Rocket plugins ──");  break;
+                        case TrackerCategory.Engine:  sb.AppendLine("  ── Unturned engine ──");  break;
+                        case TrackerCategory.Command: sb.AppendLine("  ── Commands ──");          break;
+                        default:                      sb.AppendLine("  ── Other ──");              break;
                     }
                     lastCat = e.Category;
                 }
