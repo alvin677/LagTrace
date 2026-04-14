@@ -978,8 +978,8 @@ namespace LagTrace
                 if (field.FieldType.ContainsGenericParameters)
                     continue;
 
-                if (!field.IsStatic)
-                    continue; // instance events are not safely readable
+                //if (!field.IsStatic)
+                //    continue; // instance events are not safely readable
 
                 MulticastDelegate del;
 
