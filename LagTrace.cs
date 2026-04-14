@@ -1002,6 +1002,7 @@ namespace LagTrace
 
                 results.Add(new EventInfo
                 {
+                    Namespace = type.Namespace,
                     TypeName = type.FullName,
                     EventName = ev.Name,
                     Count = count
