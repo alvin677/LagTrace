@@ -919,6 +919,104 @@ namespace LagTrace
             Logger.Log($"Total events found: {results.Count}");
         }
     }
+    public class CommandEventDump : IRocketCommand
+    {
+        public string Name => "eventdump";
+        public string Help => "Dump event subscribers";
+        public string Syntax => "/eventdump <type> <event>";
+        public AllowedCaller AllowedCaller => AllowedCaller.Both;
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "lagtrace.eventdump" };
+
+        public void Execute(IRocketPlayer caller, string[] args)
+        {
+            if (args.Length < 2)
+            {
+                Logger.Log("/eventdump <type> <event>");
+                return;
+            }
+
+            string typeName = args[0];
+            string eventName = args[1];
+
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            Type targetType = null;
+
+            // Find type
+            foreach (var asm in assemblies)
+            {
+                targetType = asm.GetTypes().FirstOrDefault(t => t.FullName == typeName);
+                if (targetType != null)
+                    break;
+            }
+
+            if (targetType == null)
+            {
+                Logger.LogError($"Type not found: {typeName}");
+                return;
+            }
+
+            // Find backing field
+            var field = targetType.GetField(eventName,
+                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+
+            if (field == null)
+            {
+                Logger.LogError($"Event backing field not found: {eventName}");
+                return;
+            }
+
+            object instance = null;
+
+            if (!field.IsStatic)
+            {
+                // Try find instance (Unity MonoBehaviour)
+                instance = UnityEngine.Object.FindObjectOfType(targetType);
+                if (instance == null)
+                {
+                    Logger.LogError("Instance not found for non-static event.");
+                    return;
+                }
+            }
+
+            var del = field.GetValue(instance) as MulticastDelegate;
+
+            if (del == null)
+            {
+                Logger.LogWarning("No subscribers.");
+                return;
+            }
+
+            var list = del.GetInvocationList();
+
+            Logger.Log($"==== Subscribers for {typeName}.{eventName} ({list.Length}) ====");
+
+            for (int i = 0; i < list.Length; i++)
+            {
+                var d = list[i];
+                var method = d.Method;
+                var target = d.Target;
+
+                string targetTypeName = target?.GetType().FullName ?? "static";
+                string asmName = method.DeclaringType?.Assembly.GetName().Name ?? "unknown";
+
+                Logger.Log($"[{i}] {method.DeclaringType.FullName}.{method.Name}");
+                Logger.Log($"     Assembly: {asmName}");
+                Logger.Log($"     Target: {targetTypeName}");
+
+                // Detect dynamic methods (uScript / Harmony / Emit)
+                if (method is System.Reflection.Emit.DynamicMethod)
+                {
+                    Logger.Log("     ⚠ DynamicMethod (likely uScript/Harmony)");
+                }
+
+                if (method.Name.Contains("lambda_method") || method.Name.Contains("<"))
+                {
+                    Logger.Log("     ⚠ Lambda/Generated method");
+                }
+            }
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  Shared helpers
