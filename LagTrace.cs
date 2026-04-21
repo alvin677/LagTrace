@@ -830,6 +830,22 @@ namespace LagTrace
             CommandHelpers.Reply(caller, "[LagTrace] Data cleared.");
         }
     }
+    public class CommandListAsm : IRocketCommand
+    {
+        public string Name => "listasm"; public string Help => "List all assemblies.";
+        public string Syntax => "/listasm"; public AllowedCaller AllowedCaller => AllowedCaller.Both;
+        public List<string> Aliases => new List<string>();
+        public List<string> Permissions => new List<string> { "lagtrace.listasm" };
+
+        public void Execute(IRocketPlayer caller, string[] args)
+        {
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
+            {
+                CommandHelpers.Reply(caller, assemblies[i].GetName().Name);
+            }
+        }
+    }
     public class CommandLagEvents : IRocketCommand
     {
         public string Name => "lagevents";
