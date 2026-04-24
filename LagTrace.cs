@@ -929,7 +929,7 @@ namespace LagTrace
             for (int i = 0; i < max; i++)
             {
                 var r = results[i];
-                Logger.Log($"{r.Namespace}.{r.TypeName}.{r.EventName} → {r.Count}");
+                Logger.Log($"{r.TypeName}.{r.EventName} → {r.Count}");
             }
 
             Logger.Log($"Total events found: {results.Count}");
@@ -1082,7 +1082,6 @@ namespace LagTrace
     {
         public struct EventInfo
         {
-            public string Namespace;
             public string TypeName;
             public string EventName;
             public int Count;
@@ -1137,8 +1136,7 @@ namespace LagTrace
 
                 results.Add(new EventInfo
                 {
-                    Namespace = type.Namespace,
-                    TypeName = type.FullName,
+                    TypeName = type.FullName, // contains Namespace
                     EventName = ev.Name,
                     Count = count
                 });
