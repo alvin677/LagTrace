@@ -943,7 +943,6 @@ namespace LagTrace
         public AllowedCaller AllowedCaller => AllowedCaller.Both;
         public List<string> Aliases => new List<string>();
         public List<string> Permissions => new List<string> { "lagtrace.eventdump" };
-
         public void Execute(IRocketPlayer caller, string[] args)
         {
             if (args.Length < 2)
@@ -955,13 +954,18 @@ namespace LagTrace
             string typeName = args[0];
             string eventName = args[1];
 
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
             Type targetType = null;
 
-            // Find type
-            foreach (var asm in assemblies)
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                targetType = asm.GetTypes().FirstOrDefault(t => t.FullName == typeName);
+                foreach (var t in GetLoadableTypes(asm))
+                {
+                    if (t.FullName == typeName)
+                    {
+                        targetType = t;
+                        break;
+                    }
+                }
                 if (targetType != null)
                     break;
             }
@@ -972,9 +976,10 @@ namespace LagTrace
                 return;
             }
 
-            // Find backing field
-            var field = targetType.GetField(eventName,
-                BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static);
+            var flags = BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static;
+
+            var field = targetType.GetField(eventName, flags)
+                ?? targetType.GetField($"<{eventName}>k__BackingField", flags);
 
             if (field == null)
             {
@@ -982,11 +987,16 @@ namespace LagTrace
                 return;
             }
 
+            if (field.FieldType.ContainsGenericParameters)
+            {
+                Logger.LogWarning("Skipping generic event field.");
+                return;
+            }
+
             object instance = null;
 
             if (!field.IsStatic)
             {
-                // Try find instance (Unity MonoBehaviour)
                 instance = UnityEngine.Object.FindObjectOfType(targetType);
                 if (instance == null)
                 {
@@ -995,7 +1005,17 @@ namespace LagTrace
                 }
             }
 
-            var del = field.GetValue(instance) as MulticastDelegate;
+            MulticastDelegate del;
+
+            try
+            {
+                del = field.GetValue(instance) as MulticastDelegate;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning($"Failed to read event field: {ex.Message}");
+                return;
+            }
 
             if (del == null)
             {
@@ -1020,17 +1040,18 @@ namespace LagTrace
                 Logger.Log($"     Assembly: {asmName}");
                 Logger.Log($"     Target: {targetTypeName}");
 
-                // Detect dynamic methods (uScript / Harmony / Emit)
                 if (method is System.Reflection.Emit.DynamicMethod)
-                {
                     Logger.Log("     ⚠ DynamicMethod (likely uScript/Harmony)");
-                }
 
-                if (method.Name.Contains("lambda_method") || method.Name.Contains("<"))
-                {
-                    Logger.Log("     ⚠ Lambda/Generated method");
-                }
+                if (method.Name.Contains("<"))
+                    Logger.Log("     ⚠ Generated/Lambda");
             }
+        }
+
+        private static IEnumerable<Type> GetLoadableTypes(Assembly asm)
+        {
+            try { return asm.GetTypes(); }
+            catch (ReflectionTypeLoadException ex) { return ex.Types.Where(t => t != null); }
         }
     }
 
