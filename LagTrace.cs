@@ -71,6 +71,7 @@ namespace LagTrace
         public bool AutoPrint;
         public int WindowSeconds;
         public int TopN;
+        public int LagPluginsTrunc;
         public float SpikeThresholdMs;
 
         public string[] CustomAssemblies;
@@ -82,6 +83,7 @@ namespace LagTrace
             SpikeThresholdMs = 50f;
             AutoPrint = false;
             TopN = 10;
+            LagPluginsTrunc = 32;
             CustomAssemblies = new string[] { "Rocket.Core" };
             CustomNameSpaces = new string[] { "Rocket.Core.Permissions.RocketPermissionsManager", "Rocket.Core.Utils.TaskDispatcher" };
         }
@@ -777,7 +779,7 @@ namespace LagTrace
                 }
                 int f = (int)Math.Round(Math.Min(e.Pct, 100.0) / 5.0);
                 string bar = new string('\u2588', f) + new string('\u2591', 20 - f);
-                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {e.TotalMs,7:F0}ms  {CommandHelpers.Trunc(e.Label, 32)}  x{e.Calls}");
+                sb.AppendLine($"  {bar}  {e.Pct,5:F1}%  {e.TotalMs,7:F0}ms  {CommandHelpers.Trunc(e.Label, LagTracePlugin.Instance.Configuration.Instance.LagPluginsTrunc)}  x{e.Calls}");
             }
             CommandHelpers.Reply(caller, sb.ToString());
         }
