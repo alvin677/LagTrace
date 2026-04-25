@@ -1,14 +1,15 @@
+using HarmonyLib;
+using Rocket.API;
+using Rocket.Core.Logging;
+using Rocket.Core.Plugins;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading;
-using HarmonyLib;
-using Rocket.API;
-using Rocket.Core.Logging;
-using Rocket.Core.Plugins;
 using UnityEngine;
 using Logger = Rocket.Core.Logging.Logger;
 
@@ -400,6 +401,9 @@ namespace LagTrace
             // slow commands are immediately visible in /lagtop.
             PatchCommandManager(h);
 
+            // Track per-script from uScript2
+            PatchUScript(h);
+
             // ── 3. Curated Unturned engine manager loops ─────────────────────────
             var asmCs = AppDomain.CurrentDomain.GetAssemblies()
                 .FirstOrDefault(a => a.GetName().Name == "Assembly-CSharp");
@@ -525,6 +529,66 @@ namespace LagTrace
                 Logger.Log($"[LagTrace] Cannot patch RocketCommandManager.Execute: {ex.Message}");
             }
         }
+        private static void PatchUScript(Harmony h)
+        {
+            try
+            {
+                var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+
+                foreach (var asm in assemblies)
+                {
+                    Type[] types;
+                    try { types = asm.GetTypes(); }
+                    catch (ReflectionTypeLoadException ex) { types = ex.Types; }
+
+                    if (types == null) continue;
+
+                    for (int i = 0; i < types.Length; i++)
+                    {
+                        var t = types[i];
+                        if (t == null) continue;
+
+                        // Heuristic:
+                        // Look for method named "A" with 1 parameter (execution context)
+                        var methods = t.GetMethods(
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+                        for (int j = 0; j < methods.Length; j++)
+                        {
+                            var m = methods[j];
+
+                            if (m.Name != "A")
+                                continue;
+
+                            var parameters = m.GetParameters();
+                            if (parameters.Length != 1)
+                                continue;
+
+                            // Optional: filter by namespace if you want
+                            if (t.Namespace == null || !t.Namespace.Contains("uScript"))
+                                continue;
+
+                            try
+                            {
+                                h.Patch(m,
+                                    prefix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(UScriptPrefix)),
+                                    postfix: new HarmonyMethod(typeof(HarmonyPatcher), nameof(UScriptPostfix)));
+
+                                Logger.Log($"[LagTrace] Patched uScript method: {t.FullName}.A");
+                            }
+                            catch
+                            {
+                                // ignore individual failures
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Log($"[LagTrace] uScript patch failed: {ex.Message}");
+            }
+        }
 
         // ── Patch helpers ────────────────────────────────────────────────────────
 
@@ -597,7 +661,75 @@ namespace LagTrace
 
             return command.Substring(0, len).ToLowerInvariant();
         }
+
+        public struct UScriptState
+        {
+            public long Start;
+            public string Key;
+        }
+        private static readonly ConcurrentDictionary<Type, FieldInfo> _nameFieldCache = new();
+        public static void UScriptPrefix(object __instance, ref UScriptState __state)
+        {
+            __state.Start = Stopwatch.GetTimestamp();
+
+            // Default fallback (fast, always valid)
+            string key = __instance.GetType().FullName;
+
+            // Try extract nicer script name (best effort, no exceptions escaping)
+            try
+            {
+                var type = __instance.GetType();
+
+                FieldInfo field;
+
+                if (!_nameFieldCache.TryGetValue(type, out field))
+                {
+                    field = null;
+
+                    var fields = type.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+
+                    for (int i = 0; i < fields.Length; i++)
+                    {
+                        var f = fields[i];
+
+                        if (f.FieldType == typeof(string) &&
+                            (f.Name.Contains("name") || f.Name.Contains("Name")))
+                        {
+                            field = f;
+                            break;
+                        }
+                    }
+
+                    _nameFieldCache[type] = field; // cache null too
+                }
+
+                if (field != null)
+                {
+                    var val = field.GetValue(__instance) as string;
+                    if (!string.IsNullOrEmpty(val))
+                        key = val;
+                }
+            }
+            catch
+            {
+                // NEVER let profiling crash anything
+            }
+
+            // normalize + intern (important for perf)
+            __state.Key = string.Intern($"uScript:{key}");
+        }
+        public static void UScriptPostfix(UScriptState __state)
+        {
+            long elapsed = Stopwatch.GetTimestamp() - __state.Start;
+
+            Timings.Record(__state.Key, elapsed);
+
+            if (!_labels.ContainsKey(__state.Key))
+                _labels[__state.Key] = (__state.Key, TrackerCategory.Plugin);
+        }
     }
+
+
 
     // ─────────────────────────────────────────────────────────────────────────────
     //  SpikeDetector — safe because Feed() is called from LateUpdate (main thread).
